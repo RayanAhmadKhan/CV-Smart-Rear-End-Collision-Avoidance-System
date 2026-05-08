@@ -22,7 +22,7 @@ class RearCollisionMonitorApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: scheme,
-        scaffoldBackgroundColor: const Color(0xFFF5F8FC),
+        scaffoldBackgroundColor: const Color(0xFF0A0F16),
       ),
       home: const RearDistanceDashboard(),
     );
@@ -39,15 +39,61 @@ class ObjectDetection {
   final double minY;
   final double maxY;
   final double width;
+  final double height;
+  final double distance;
+  final Color color;
 
   ObjectDetection({
     required this.minX,
     required this.maxX,
     required this.minY,
     required this.maxY,
-  }) : width = (maxX - minX).abs();
+    required this.distance,
+    required this.color,
+  })  : width = (maxX - minX).abs(),
+        height = (maxY - minY).abs();
 
-  double get height => (maxY - minY).abs();
+  Rect get rect => Rect.fromLTRB(minX, minY, maxX, maxY);
+
+  /// Center of the bounding box
+  Offset get center => Offset((minX + maxX) / 2, (minY + maxY) / 2);
+
+  /// Area of the bounding box (proxy for object size)
+  double get area => width * height;
+
+  /// Returns how well this detection overlaps with [other] using IoU
+  double iou(ObjectDetection other) {
+    final interLeft = minX > other.minX ? minX : other.minX;
+    final interTop = minY > other.minY ? minY : other.minY;
+    final interRight = maxX < other.maxX ? maxX : other.maxX;
+    final interBottom = maxY < other.maxY ? maxY : other.maxY;
+
+    final interW = interRight - interLeft;
+    final interH = interBottom - interTop;
+    if (interW <= 0 || interH <= 0) return 0.0;
+
+    final interArea = interW * interH;
+    final unionArea = area + other.area - interArea;
+    return unionArea > 0 ? interArea / unionArea : 0.0;
+  }
+}
+
+/// Helper to smooth jumpy distance values using a moving average
+class DistanceSmoother {
+  final List<double> _buffer = [];
+  final int windowSize;
+
+  DistanceSmoother({this.windowSize = 8});
+
+  double add(double value) {
+    _buffer.add(value);
+    if (_buffer.length > windowSize) {
+      _buffer.removeAt(0);
+    }
+    return _buffer.reduce((a, b) => a + b) / _buffer.length;
+  }
+
+  void clear() => _buffer.clear();
 }
 
 class RearDistanceDashboard extends StatefulWidget {
@@ -59,10 +105,27 @@ class RearDistanceDashboard extends StatefulWidget {
 
 class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-  static const double _warningThresholdM = 1.5;
-  static const double _dangerThresholdM = 0.8;
-  static const double _knownObjectWidthM = 0.5;
-  static const double _calibratedFocalLength = 0.62;
+  static const double _warningThresholdM = 1.8;
+  static const double _dangerThresholdM = 0.7;
+  static const double _knownObjectWidthM = 0.45;
+  static const double _calibratedFocalLength = 0.65;
+
+  // ── Single-object locking ──────────────────────────────────────────────────
+  /// The bounding box we are currently locked onto (in image coords).
+  ObjectDetection? _lockedDetection;
+
+  /// How many consecutive frames the locked object has been missing.
+  int _missingFrameCount = 0;
+
+  /// Release the lock after this many consecutive frames with no match.
+  static const int _maxMissingFrames = 8;
+
+  /// Minimum IoU to consider a new detection the "same" object as the locked one.
+  static const double _iouMatchThreshold = 0.15;
+
+  /// Maximum centre-distance (in image-width fraction) to match when IoU is low.
+  static const double _centreFractionThreshold = 0.30;
+  // ──────────────────────────────────────────────────────────────────────────
 
   CameraController? _cameraController;
   bool _isCameraReady = false;
@@ -75,6 +138,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   String _collisionStatus = 'Idle';
   Color _targetColor = const Color(0xFFE53935);
   double _colorTolerance = 75;
+  final DistanceSmoother _distanceSmoother = DistanceSmoother();
   Uint8List? _previousLuma;
   List<ObjectDetection> _detections = [];
 
@@ -94,9 +158,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) {
-      return;
-    }
+    if (controller == null || !controller.value.isInitialized) return;
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
       controller.stopImageStream();
@@ -149,13 +211,11 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         return;
       }
 
-      // Try to start image streaming (not supported on all platforms like Windows web)
       bool supportsStreaming = false;
       try {
         await controller.startImageStream(_processFrame);
         supportsStreaming = true;
       } catch (_) {
-        // Frame streaming not supported on this platform
         supportsStreaming = false;
       }
 
@@ -167,9 +227,8 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       setState(() {
         _cameraController = controller;
         _supportsFrameProcessing = supportsStreaming;
-        _sensorStatus = supportsStreaming 
-            ? 'Connected' 
-            : 'Connected (preview only)';
+        _sensorStatus =
+            supportsStreaming ? 'Connected' : 'Connected (preview only)';
         _isCameraReady = true;
       });
     } catch (e) {
@@ -183,14 +242,14 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     }
   }
 
+  // ── Core frame processing with single-object locking ──────────────────────
+
   void _processFrame(CameraImage image) {
-    if (_isProcessingFrame) {
-      return;
-    }
+    if (_isProcessingFrame) return;
     _isProcessingFrame = true;
 
     try {
-      final detections = _trackingMode == TrackingMode.anyObject
+      final candidates = _trackingMode == TrackingMode.anyObject
           ? _detectAnyObject(image)
           : _detectTargetColorObject(image);
 
@@ -199,40 +258,101 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         return;
       }
 
-      if (detections.isEmpty) {
-        setState(() {
-          _distanceM = null;
-          _collisionStatus = 'No target';
-          _detections = [];
-        });
-        _updateSafetyState(SafetyState.unknown);
+      if (candidates.isEmpty) {
+        // No detections at all
+        _missingFrameCount++;
+        if (_missingFrameCount >= _maxMissingFrames) {
+          // Release lock after sustained absence
+          _lockedDetection = null;
+          _missingFrameCount = 0;
+          _distanceSmoother.clear();
+          setState(() {
+            _distanceM = null;
+            _collisionStatus = 'Scanning...';
+            _detections = [];
+          });
+          _updateSafetyState(SafetyState.unknown);
+        }
+        // else: keep the last locked box visible for a few frames (reduces flicker)
         return;
       }
 
+      // ── Match candidates to the currently locked object ──────────────────
+      final imageWidth = image.width.toDouble();
+      ObjectDetection? matched;
+
+      if (_lockedDetection == null) {
+        // No lock yet — choose the largest (most prominent) candidate
+        matched = candidates.reduce(
+            (a, b) => a.area >= b.area ? a : b);
+      } else {
+        // Try to find the best match for the locked object among candidates
+        double bestScore = -1.0;
+        for (final candidate in candidates) {
+          final iou = _lockedDetection!.iou(candidate);
+          // Also compute normalised centre distance as a fallback
+          final dx =
+              (candidate.center.dx - _lockedDetection!.center.dx) / imageWidth;
+          final dy =
+              (candidate.center.dy - _lockedDetection!.center.dy) / imageWidth;
+          final centreDist = (dx * dx + dy * dy);
+
+          // Combine IoU + proximity into a single score
+          final score = iou + (1.0 - centreDist.clamp(0.0, 1.0));
+
+          if (score > bestScore) {
+            bestScore = score;
+            matched = candidate;
+          }
+        }
+
+        // Accept the match only if it's close enough
+        final iouOk = _lockedDetection!.iou(matched!) >= _iouMatchThreshold;
+        final dx = (matched.center.dx - _lockedDetection!.center.dx) / imageWidth;
+        final dy = (matched.center.dy - _lockedDetection!.center.dy) / imageWidth;
+        final centreOk =
+            (dx * dx + dy * dy) <= _centreFractionThreshold * _centreFractionThreshold;
+
+        if (!iouOk && !centreOk) {
+          // The best candidate is too far from the locked object — keep old lock
+          // and increment missing counter
+          _missingFrameCount++;
+          if (_missingFrameCount >= _maxMissingFrames) {
+            // Switch to the new largest object (re-acquire)
+            _lockedDetection = candidates.reduce(
+                (a, b) => a.area >= b.area ? a : b);
+            _missingFrameCount = 0;
+            _distanceSmoother.clear();
+          }
+          return;
+        }
+      }
+
+      // We have a confirmed matched detection — update lock
+      _lockedDetection = matched;
+      _missingFrameCount = 0;
+
+      final smoothedDistance = _distanceSmoother.add(matched!.distance);
+
+      // Rebuild the detection with the smoothed distance & correct colour
+      final displayDetection = ObjectDetection(
+        minX: matched.minX,
+        maxX: matched.maxX,
+        minY: matched.minY,
+        maxY: matched.maxY,
+        distance: smoothedDistance,
+        color: _getDistanceColor(smoothedDistance),
+      );
+
       setState(() {
-        _detections = detections;
+        _detections = [displayDetection]; // Always exactly ONE box
+        _distanceM = smoothedDistance;
+        _collisionStatus = 'Tracking Object';
       });
 
-      // Calculate distances for all detections
-      final distances = detections.map((detection) {
-        final objectWidthRatio = detection.width / image.width;
-        return (_knownObjectWidthM * _calibratedFocalLength) / objectWidthRatio;
-      }).toList();
-
-      // Find nearest object
-      final nearestDistance = distances.reduce((a, b) => a < b ? a : b);
-      final clampedDistance = nearestDistance.clamp(0.2, 10.0);
-
-      setState(() {
-        _distanceM = clampedDistance;
-        _collisionStatus = _trackingMode == TrackingMode.anyObject
-            ? 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}'
-            : 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}';
-      });
-
-      if (clampedDistance < _dangerThresholdM) {
+      if (smoothedDistance < _dangerThresholdM) {
         _updateSafetyState(SafetyState.danger);
-      } else if (clampedDistance < _warningThresholdM) {
+      } else if (smoothedDistance < _warningThresholdM) {
         _updateSafetyState(SafetyState.warning);
       } else {
         _updateSafetyState(SafetyState.safe);
@@ -241,6 +361,8 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       _isProcessingFrame = false;
     }
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
 
   List<ObjectDetection> _detectAnyObject(CameraImage image) {
     final width = image.width;
@@ -254,185 +376,221 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       return [];
     }
 
-    // Motion detection
-    int minX = width;
-    int maxX = 0;
-    int minY = height;
-    int maxY = 0;
-    int motionPixels = 0;
+    const int gridSize = 20;
+    final int cols = width ~/ gridSize;
+    final int rows = height ~/ gridSize;
+    final List<bool> activeGrid = List.filled(cols * rows, false);
 
-    const int motionThreshold = 20;
+    const int motionThreshold = 25;
+    bool motionFound = false;
 
-    for (int y = 0; y < height; y += 4) {
-      for (int x = 0; x < width; x += 4) {
+    for (int y = 0; y < height; y += 8) {
+      for (int x = 0; x < width; x += 8) {
         final index = y * yBytesPerRow + x;
         if (index < yPlane.length && index < previous.length) {
           final diff = (yPlane[index] - previous[index]).abs();
           if (diff > motionThreshold) {
-            motionPixels++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
+            final gridX = x ~/ gridSize;
+            final gridY = y ~/ gridSize;
+            activeGrid[gridY * cols + gridX] = true;
+            motionFound = true;
           }
         }
       }
     }
 
     _previousLuma = Uint8List.fromList(yPlane);
+    if (!motionFound) return [];
 
-    // If motion detected
-    if (motionPixels > 20 && maxX > minX && maxY > minY) {
-      return [ObjectDetection(
-        minX: minX.toDouble(),
-        maxX: maxX.toDouble(),
-        minY: minY.toDouble(),
-        maxY: maxY.toDouble(),
-      )];
-    }
+    final List<ObjectDetection> detections = [];
+    final List<bool> visited = List.filled(cols * rows, false);
 
-    // Strong edge detection for static objects using Sobel-like approach
-    minX = width;
-    maxX = 0;
-    minY = height;
-    maxY = 0;
-    int edgePixels = 0;
+    for (int i = 0; i < activeGrid.length; i++) {
+      if (activeGrid[i] && !visited[i]) {
+        int minGX = i % cols,
+            maxGX = i % cols,
+            minGY = i ~/ cols,
+            maxGY = i ~/ cols;
 
-    const int step = 3;
-    const int strongEdgeThreshold = 40;
+        final List<int> queue = [i];
+        visited[i] = true;
+        int clusterSize = 0;
 
-    for (int y = step; y < height - step; y += step) {
-      for (int x = step; x < width - step; x += step) {
-        final idx = y * yBytesPerRow + x;
-        if (idx + step < yPlane.length) {
-          final center = yPlane[idx];
-          
-          // Sobel-like gradients
-          final gx = (yPlane[idx + step] - yPlane[idx - step]).abs();
-          final gy = (yPlane[idx + (step * yBytesPerRow)] - yPlane[idx - (step * yBytesPerRow)]).abs();
-          
-          final edgeStrength = (gx + gy) ~/ 2;
-          
-          // Only detect strong edges
-          if (edgeStrength > strongEdgeThreshold) {
-            edgePixels++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
+        while (queue.isNotEmpty && clusterSize < 50) {
+          final current = queue.removeAt(0);
+          clusterSize++;
+          final cx = current % cols;
+          final cy = (current / cols).floor();
+
+          if (cx < minGX) minGX = cx;
+          if (cx > maxGX) maxGX = cx;
+          if (cy < minGY) minGY = cy;
+          if (cy > maxGY) maxGY = cy;
+
+          for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+              final nx = cx + dx;
+              final ny = cy + dy;
+              if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+                final nIdx = ny * cols + nx;
+                if (activeGrid[nIdx] && !visited[nIdx]) {
+                  visited[nIdx] = true;
+                  queue.add(nIdx);
+                }
+              }
+            }
           }
+        }
+
+        if (clusterSize > 3) {
+          final minX = minGX * gridSize.toDouble();
+          final maxX = (maxGX + 1) * gridSize.toDouble();
+          final minY = minGY * gridSize.toDouble();
+          final maxY = (maxGY + 1) * gridSize.toDouble();
+
+          final objWidthRatio = (maxX - minX) / width;
+          final distance =
+              (_knownObjectWidthM * _calibratedFocalLength) / objWidthRatio;
+          final clampedDist = distance.clamp(0.2, 8.0);
+
+          detections.add(ObjectDetection(
+            minX: minX,
+            maxX: maxX,
+            minY: minY,
+            maxY: maxY,
+            distance: clampedDist,
+            color: _getDistanceColor(clampedDist),
+          ));
         }
       }
     }
 
-    // Require significant edge regions
-    if (edgePixels > 40 && maxX > minX && maxY > minY) {
-      final widthPx = maxX - minX;
-      final heightPx = maxY - minY;
-      
-      // Filter out very thin or elongated detections (likely noise)
-      if (widthPx > 20 && heightPx > 20) {
-        return [ObjectDetection(
-          minX: minX.toDouble(),
-          maxX: maxX.toDouble(),
-          minY: minY.toDouble(),
-          maxY: maxY.toDouble(),
-        )];
-      }
-    }
+    return detections;
+  }
 
-    return [];
+  Color _getDistanceColor(double distance) {
+    if (distance < _dangerThresholdM) return const Color(0xFFC23A22);
+    if (distance < _warningThresholdM) return const Color(0xFFD47D00);
+    return const Color(0xFF1D8A4A);
   }
 
   List<ObjectDetection> _detectTargetColorObject(CameraImage image) {
     final width = image.width;
     final height = image.height;
-
     final yPlane = image.planes[0].bytes;
     final uPlane = image.planes[1].bytes;
     final vPlane = image.planes[2].bytes;
-
     final yBytesPerRow = image.planes[0].bytesPerRow;
     final uBytesPerRow = image.planes[1].bytesPerRow;
     final uBytesPerPixel = image.planes[1].bytesPerPixel ?? 1;
     final vBytesPerRow = image.planes[2].bytesPerRow;
     final vBytesPerPixel = image.planes[2].bytesPerPixel ?? 1;
 
-    int minX = width;
-    int maxX = 0;
-    int minY = height;
-    int maxY = 0;
-    int targetPixels = 0;
+    const int gridSize = 16;
+    final int cols = width ~/ gridSize;
+    final int rows = height ~/ gridSize;
+    final List<bool> activeGrid = List.filled(cols * rows, false);
 
     final targetR = _targetColor.red;
     final targetG = _targetColor.green;
     final targetB = _targetColor.blue;
-    final maxDistanceSquared = _colorTolerance * _colorTolerance;
+    final maxDistSq = _colorTolerance * _colorTolerance;
 
-    for (int y = 0; y < height; y += 4) {
-      for (int x = 0; x < width; x += 4) {
+    for (int gy = 0; gy < rows; gy++) {
+      for (int gx = 0; gx < cols; gx++) {
+        final x = gx * gridSize + (gridSize ~/ 2);
+        final y = gy * gridSize + (gridSize ~/ 2);
+
         final yIndex = y * yBytesPerRow + x;
         final uvRow = y ~/ 2;
         final uvCol = x ~/ 2;
-
         final uIndex = uvRow * uBytesPerRow + uvCol * uBytesPerPixel;
         final vIndex = uvRow * vBytesPerRow + uvCol * vBytesPerPixel;
 
-        if (yIndex >= yPlane.length || uIndex >= uPlane.length || vIndex >= vPlane.length) {
-          continue;
-        }
+        if (yIndex < yPlane.length &&
+            uIndex < uPlane.length &&
+            vIndex < vPlane.length) {
+          final yVal = yPlane[yIndex].toDouble();
+          final uVal = uPlane[uIndex].toDouble() - 128.0;
+          final vVal = vPlane[vIndex].toDouble() - 128.0;
 
-        final yValue = yPlane[yIndex].toDouble();
-        final uValue = uPlane[uIndex].toDouble() - 128.0;
-        final vValue = vPlane[vIndex].toDouble() - 128.0;
+          final r = (yVal + 1.402 * vVal).clamp(0, 255);
+          final g =
+              (yVal - 0.344136 * uVal - 0.714136 * vVal).clamp(0, 255);
+          final b = (yVal + 1.772 * uVal).clamp(0, 255);
 
-        final r = (yValue + 1.402 * vValue).clamp(0, 255).toInt();
-        final g = (yValue - 0.344136 * uValue - 0.714136 * vValue)
-            .clamp(0, 255)
-            .toInt();
-        final b = (yValue + 1.772 * uValue).clamp(0, 255).toInt();
-
-        final dr = (r - targetR).toDouble();
-        final dg = (g - targetG).toDouble();
-        final db = (b - targetB).toDouble();
-        final colorDistanceSquared = (dr * dr) + (dg * dg) + (db * db);
-
-        if (colorDistanceSquared <= maxDistanceSquared) {
-          targetPixels++;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
+          final distSq = (r - targetR) * (r - targetR) +
+              (g - targetG) * (g - targetG) +
+              (b - targetB) * (b - targetB);
+          if (distSq < maxDistSq) {
+            activeGrid[gy * cols + gx] = true;
+          }
         }
       }
     }
 
-    if (targetPixels > 15 && maxX > minX && maxY > minY) {
-      return [ObjectDetection(
-        minX: minX.toDouble(),
-        maxX: maxX.toDouble(),
-        minY: minY.toDouble(),
-        maxY: maxY.toDouble(),
-      )];
+    final List<ObjectDetection> detections = [];
+    final List<bool> visited = List.filled(cols * rows, false);
+
+    for (int i = 0; i < activeGrid.length; i++) {
+      if (activeGrid[i] && !visited[i]) {
+        int minGX = i % cols,
+            maxGX = i % cols,
+            minGY = i ~/ cols,
+            maxGY = i ~/ cols;
+        final List<int> queue = [i];
+        visited[i] = true;
+        int size = 0;
+
+        while (queue.isNotEmpty && size < 40) {
+          final c = queue.removeAt(0);
+          size++;
+          final cx = c % cols, cy = c ~/ cols;
+          if (cx < minGX) minGX = cx;
+          if (cx > maxGX) maxGX = cx;
+          if (cy < minGY) minGY = cy;
+          if (cy > maxGY) maxGY = cy;
+
+          for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+              final nx = cx + dx, ny = cy + dy;
+              if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) {
+                final nIdx = ny * cols + nx;
+                if (activeGrid[nIdx] && !visited[nIdx]) {
+                  visited[nIdx] = true;
+                  queue.add(nIdx);
+                }
+              }
+            }
+          }
+        }
+
+        if (size > 2) {
+          final minX = minGX * gridSize.toDouble(),
+              maxX = (maxGX + 1) * gridSize.toDouble();
+          final minY = minGY * gridSize.toDouble(),
+              maxY = (maxGY + 1) * gridSize.toDouble();
+          final ratio = (maxX - minX) / width;
+          final dist =
+              ((_knownObjectWidthM * _calibratedFocalLength) / ratio)
+                  .clamp(0.2, 8.0);
+
+          detections.add(ObjectDetection(
+            minX: minX,
+            maxX: maxX,
+            minY: minY,
+            maxY: maxY,
+            distance: dist,
+            color: _getDistanceColor(dist),
+          ));
+        }
+      }
     }
-
-    return [];
-  }
-
-  List<ObjectDetection> _clusterObjects(
-    List<bool> pixelMap,
-    int width,
-    int height,
-    int minPixels,
-  ) {
-    // This function is no longer used but kept for compatibility
-    return [];
+    return detections;
   }
 
   void _updateSafetyState(SafetyState nextState) {
-    if (_safetyState == nextState) {
-      return;
-    }
+    if (_safetyState == nextState) return;
 
     final previousState = _safetyState;
     setState(() {
@@ -452,12 +610,20 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   }
 
   void _triggerWarningSound({required bool isDanger}) {
-    // Hook for warning sound integration.
     SystemSound.play(SystemSoundType.alert);
     HapticFeedback.mediumImpact();
-    if (isDanger) {
-      HapticFeedback.heavyImpact();
-    }
+    if (isDanger) HapticFeedback.heavyImpact();
+  }
+
+  /// Resets the object lock manually (e.g. when user switches tracking mode)
+  void _resetLock() {
+    _lockedDetection = null;
+    _missingFrameCount = 0;
+    _distanceSmoother.clear();
+    _previousLuma = null;
+    _detections = [];
+    _distanceM = null;
+    _collisionStatus = 'Scanning...';
   }
 
   Color _stateColor() {
@@ -486,11 +652,8 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     }
   }
 
-  String _trackingModeLabel() {
-    return _trackingMode == TrackingMode.anyObject
-        ? 'Any Object'
-        : 'Target Color';
-  }
+  String _trackingModeLabel() =>
+      _trackingMode == TrackingMode.anyObject ? 'Any Object' : 'Target Color';
 
   @override
   Widget build(BuildContext context) {
@@ -499,7 +662,9 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     final stateLabel = _stateLabel();
     final distanceLabel = !_supportsFrameProcessing
         ? 'N/A'
-        : _distanceM == null ? '--.- m' : '${_distanceM!.toStringAsFixed(2)} m';
+        : _distanceM == null
+            ? '--.- m'
+            : '${_distanceM!.toStringAsFixed(2)} m';
     final isDanger = _safetyState == SafetyState.danger;
 
     final badgeColor = switch (_safetyState) {
@@ -514,43 +679,57 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
           children: [
+            // ── Header ──────────────────────────────────────────────────────
             Row(
               children: [
                 Container(
-                  width: 48,
-                  height: 48,
+                  width: 52,
+                  height: 52,
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0E6BA8),
-                    borderRadius: BorderRadius.circular(14),
+                    gradient: const LinearGradient(
+                      colors: [Color(0xFF0E6BA8), Color(0xFF0A4D7A)],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    ),
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF0E6BA8).withValues(alpha: 0.3),
+                        blurRadius: 10,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
                   ),
-                  child: const Icon(
-                    Icons.directions_car_rounded,
-                    color: Colors.white,
-                  ),
+                  child: const Icon(Icons.auto_graph_rounded,
+                      color: Colors.white, size: 28),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 16),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Rear Distance Monitor',
-                        style: theme.textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
+                        'Smart Rear Monitor',
+                        style: theme.textTheme.headlineSmall?.copyWith(
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                          letterSpacing: -0.5,
                         ),
                       ),
                       Text(
-                        'Obstacle awareness dashboard',
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: const Color(0xFF607086),
-                        ),
+                        'Single-Object Focus & Distance Detection',
+                        style: theme.textTheme.bodyMedium
+                            ?.copyWith(color: const Color(0xFF94A3B8)),
                       ),
                     ],
                   ),
                 ),
               ],
             ),
+
             const SizedBox(height: 24),
+
+            // ── Camera Preview ───────────────────────────────────────────────
             Container(
               height: 210,
               decoration: BoxDecoration(
@@ -566,17 +745,57 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                         CustomPaint(
                           painter: BoundingBoxPainter(
                             detections: _detections,
-                            imageWidth: _cameraController!.value.previewSize?.width ?? 1,
-                            imageHeight: _cameraController!.value.previewSize?.height ?? 1,
+                            imageWidth: _cameraController!
+                                    .value.previewSize?.width ??
+                                1,
+                            imageHeight: _cameraController!
+                                    .value.previewSize?.height ??
+                                1,
+                            isLocked: _lockedDetection != null,
+                          ),
+                        ),
+                        // Lock indicator badge
+                        if (_lockedDetection != null)
+                          Positioned(
+                            top: 10,
+                            right: 10,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 5),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF0E6BA8)
+                                    .withValues(alpha: 0.85),
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: const [
+                                  Icon(Icons.lock_rounded,
+                                      color: Colors.white, size: 12),
+                                  SizedBox(width: 4),
+                                  Text('Locked',
+                                      style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700)),
+                                ],
+                              ),
+                            ),
+                          ),
+                        // Tap to reset lock
+                        Positioned.fill(
+                          child: GestureDetector(
+                            onTap: () {
+                              setState(_resetLock);
+                            },
+                            behavior: HitTestBehavior.translucent,
                           ),
                         ),
                         Align(
                           alignment: Alignment.bottomCenter,
                           child: Container(
                             padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
-                            ),
+                                horizontal: 12, vertical: 8),
                             margin: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
                               color: Colors.black.withValues(alpha: 0.55),
@@ -584,9 +803,11 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                             ),
                             child: Text(
                               _supportsFrameProcessing
-                                  ? 'Mode: ${_trackingMode == TrackingMode.anyObject ? 'Any object' : 'Target color'}'
+                                  ? (_lockedDetection != null
+                                      ? 'Tap to reset lock'
+                                      : 'Mode: ${_trackingMode == TrackingMode.anyObject ? "Any object" : "Target color"} • Searching…')
                                   : 'Preview only (frame processing unavailable)',
-                              style: TextStyle(color: Colors.white),
+                              style: const TextStyle(color: Colors.white),
                             ),
                           ),
                         ),
@@ -596,20 +817,13 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          const Icon(
-                            Icons.camera_alt_rounded,
-                            size: 48,
-                            color: Colors.white38,
-                          ),
+                          const Icon(Icons.camera_alt_rounded,
+                              size: 48, color: Colors.white38),
                           const SizedBox(height: 12),
-                          Text(
-                            _sensorStatus,
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 14,
-                            ),
-                            textAlign: TextAlign.center,
-                          ),
+                          Text(_sensorStatus,
+                              style: const TextStyle(
+                                  color: Colors.white70, fontSize: 14),
+                              textAlign: TextAlign.center),
                           const SizedBox(height: 16),
                           ElevatedButton.icon(
                             onPressed: _initializeCamera,
@@ -624,22 +838,24 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                       ),
                     ),
             ),
+
             const SizedBox(height: 20),
+
+            // ── Tracking Configuration ───────────────────────────────────────
             Container(
-              padding: const EdgeInsets.all(16),
+              padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(18),
+                color: const Color(0xFF1E293B),
+                borderRadius: BorderRadius.circular(24),
+                border:
+                    Border.all(color: Colors.white.withValues(alpha: 0.05)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    'Tracking Configuration',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
+                  Text('Tracking Configuration',
+                      style: theme.textTheme.titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w700)),
                   const SizedBox(height: 10),
                   if (!_supportsFrameProcessing)
                     Container(
@@ -650,18 +866,14 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                       ),
                       child: Row(
                         children: [
-                          const Icon(
-                            Icons.info_rounded,
-                            color: Color(0xFF856404),
-                            size: 20,
-                          ),
+                          const Icon(Icons.info_rounded,
+                              color: Color(0xFF856404), size: 20),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
                               'Distance detection requires a device that supports frame streaming (phones/tablets).',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: const Color(0xFF856404),
-                              ),
+                              style: theme.textTheme.bodySmall
+                                  ?.copyWith(color: const Color(0xFF856404)),
                             ),
                           ),
                         ],
@@ -683,27 +895,23 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                       ],
                       selected: {_trackingMode},
                       onSelectionChanged: (selection) {
-                        final selectedMode = selection.first;
                         setState(() {
-                          _trackingMode = selectedMode;
-                          _distanceM = null;
-                          _collisionStatus = 'Mode switched';
-                          _previousLuma = null;
-                          _detections = [];
+                          _trackingMode = selection.first;
+                          _resetLock();
                         });
                       },
                     ),
                     const SizedBox(height: 10),
                     Text(
                       _trackingMode == TrackingMode.anyObject
-                          ? 'Tracks moving objects in rear camera view.'
-                          : 'Tracks objects close to selected color.',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: const Color(0xFF607086),
-                      ),
+                          ? 'Locks onto the largest moving object detected.'
+                          : 'Locks onto the closest object matching the target color.',
+                      style: theme.textTheme.bodyMedium
+                          ?.copyWith(color: const Color(0xFF607086)),
                     ),
                   ],
-                  if (_trackingMode == TrackingMode.targetColor && _supportsFrameProcessing) ...[
+                  if (_trackingMode == TrackingMode.targetColor &&
+                      _supportsFrameProcessing) ...[
                     const SizedBox(height: 14),
                     Row(
                       children: [
@@ -714,15 +922,12 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                             color: _targetColor,
                             borderRadius: BorderRadius.circular(6),
                             border: Border.all(
-                              color: const Color(0xFFCBD5E1),
-                            ),
+                                color: const Color(0xFFCBD5E1)),
                           ),
                         ),
                         const SizedBox(width: 10),
-                        Text(
-                          'Selected Color',
-                          style: theme.textTheme.bodyMedium,
-                        ),
+                        Text('Selected Color',
+                            style: theme.textTheme.bodyMedium),
                       ],
                     ),
                     const SizedBox(height: 8),
@@ -730,52 +935,41 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                       label: 'Red',
                       value: _targetColor.red.toDouble(),
                       activeColor: Colors.red,
-                      onChanged: (value) {
-                        setState(() {
-                          _targetColor = _targetColor.withRed(value.toInt());
-                        });
-                      },
+                      onChanged: (v) => setState(
+                          () => _targetColor = _targetColor.withRed(v.toInt())),
                     ),
                     _ColorChannelSlider(
                       label: 'Green',
                       value: _targetColor.green.toDouble(),
                       activeColor: Colors.green,
-                      onChanged: (value) {
-                        setState(() {
-                          _targetColor = _targetColor.withGreen(value.toInt());
-                        });
-                      },
+                      onChanged: (v) => setState(() =>
+                          _targetColor = _targetColor.withGreen(v.toInt())),
                     ),
                     _ColorChannelSlider(
                       label: 'Blue',
                       value: _targetColor.blue.toDouble(),
                       activeColor: Colors.blue,
-                      onChanged: (value) {
-                        setState(() {
-                          _targetColor = _targetColor.withBlue(value.toInt());
-                        });
-                      },
+                      onChanged: (v) => setState(() =>
+                          _targetColor = _targetColor.withBlue(v.toInt())),
                     ),
                     const SizedBox(height: 4),
-                    Text(
-                      'Tolerance: ${_colorTolerance.toStringAsFixed(0)}',
-                      style: theme.textTheme.bodySmall,
-                    ),
+                    Text('Tolerance: ${_colorTolerance.toStringAsFixed(0)}',
+                        style: theme.textTheme.bodySmall),
                     Slider(
                       value: _colorTolerance,
                       min: 20,
                       max: 140,
-                      onChanged: (value) {
-                        setState(() {
-                          _colorTolerance = value;
-                        });
-                      },
+                      onChanged: (v) =>
+                          setState(() => _colorTolerance = v),
                     ),
                   ],
                 ],
               ),
             ),
+
             const SizedBox(height: 20),
+
+            // ── Distance Display ─────────────────────────────────────────────
             Container(
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
@@ -808,9 +1002,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                       ),
                       Container(
                         padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
+                            horizontal: 10, vertical: 6),
                         decoration: BoxDecoration(
                           color: Colors.white.withValues(alpha: 0.2),
                           borderRadius: BorderRadius.circular(999),
@@ -818,10 +1010,9 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                         child: Text(
                           '$stateLabel • ${_trackingModeLabel()}',
                           style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w600,
-                            fontSize: 12,
-                          ),
+                              color: Colors.white,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 12),
                         ),
                       ),
                     ],
@@ -840,16 +1031,17 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                     !_supportsFrameProcessing
                         ? 'Frame processing not available on this platform'
                         : _distanceM == null
-                            ? 'Searching for tracked object'
-                            : 'Estimated from object size in frame',
+                            ? 'Searching for object to lock onto'
+                            : 'Locked — estimated from object size in frame',
                     style: theme.textTheme.bodyMedium?.copyWith(
-                      color: Colors.white.withValues(alpha: 0.85),
-                    ),
+                        color: Colors.white.withValues(alpha: 0.85)),
                   ),
                 ],
               ),
             ),
+
             const SizedBox(height: 20),
+
             Row(
               children: [
                 Expanded(
@@ -879,6 +1071,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                 ),
               ],
             ),
+
             if (isDanger) ...[
               const SizedBox(height: 16),
               Center(
@@ -902,11 +1095,8 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                             color: Color(0xFFC23A22),
                             shape: BoxShape.circle,
                           ),
-                          child: const Icon(
-                            Icons.priority_high_rounded,
-                            color: Colors.white,
-                            size: 34,
-                          ),
+                          child: const Icon(Icons.priority_high_rounded,
+                              color: Colors.white, size: 34),
                         ),
                       ),
                     );
@@ -914,22 +1104,24 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                 ),
               ),
             ],
+
             const SizedBox(height: 20),
+
+            // ── Status Panel ─────────────────────────────────────────────────
             Container(
-              padding: const EdgeInsets.all(18),
+              padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
+                color: const Color(0xFF1E293B),
+                borderRadius: BorderRadius.circular(24),
+                border:
+                    Border.all(color: Colors.white.withValues(alpha: 0.05)),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    'Rear View Status',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
+                  Text('Rear View Status',
+                      style: theme.textTheme.titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w700)),
                   const SizedBox(height: 12),
                   _StatusRow(
                     label: 'Sensor Connection',
@@ -937,6 +1129,14 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                     color: _isCameraReady
                         ? const Color(0xFF1D8A4A)
                         : const Color(0xFFC23A22),
+                  ),
+                  const SizedBox(height: 8),
+                  _StatusRow(
+                    label: 'Object Lock',
+                    status: _lockedDetection != null ? 'Locked' : 'Searching',
+                    color: _lockedDetection != null
+                        ? const Color(0xFF0E6BA8)
+                        : const Color(0xFF607086),
                   ),
                   const SizedBox(height: 8),
                   _StatusRow(
@@ -955,7 +1155,8 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                   const SizedBox(height: 8),
                   _StatusRow(
                     label: 'Frame Processing',
-                    status: _supportsFrameProcessing ? 'Active' : 'Not supported',
+                    status:
+                        _supportsFrameProcessing ? 'Active' : 'Not supported',
                     color: _supportsFrameProcessing
                         ? const Color(0xFF1D8A4A)
                         : const Color(0xFFC23A22),
@@ -988,25 +1189,31 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   }
 }
 
+// ── BoundingBoxPainter ───────────────────────────────────────────────────────
+
 class BoundingBoxPainter extends CustomPainter {
   final List<ObjectDetection> detections;
   final double imageWidth;
   final double imageHeight;
+  final bool isLocked;
 
   BoundingBoxPainter({
     required this.detections,
     required this.imageWidth,
     required this.imageHeight,
+    this.isLocked = false,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (imageWidth == 0 || imageHeight == 0) return;
+
     final scaleX = size.width / imageWidth;
     final scaleY = size.height / imageHeight;
 
-    for (int i = 0; i < detections.length; i++) {
-      final detection = detections[i];
-      
+    _drawDistanceLines(canvas, size);
+
+    for (final detection in detections) {
       final rect = Rect.fromLTRB(
         detection.minX * scaleX,
         detection.minY * scaleY,
@@ -1014,43 +1221,107 @@ class BoundingBoxPainter extends CustomPainter {
         detection.maxY * scaleY,
       );
 
-      // Draw border
-      canvas.drawRect(
-        rect,
-        Paint()
-          ..color = const Color(0xFF00FF00)
-          ..strokeWidth = 3
-          ..style = PaintingStyle.stroke,
-      );
+      final paint = Paint()
+        ..color = detection.color
+        ..strokeWidth = isLocked ? 4.0 : 3.0
+        ..style = PaintingStyle.stroke;
 
-      // Draw label with object index
+      _drawCorners(canvas, rect, paint);
+
+      // Lock crosshair at centre when locked
+      if (isLocked) {
+        final cx = (rect.left + rect.right) / 2;
+        final cy = (rect.top + rect.bottom) / 2;
+        final crossPaint = Paint()
+          ..color = detection.color.withValues(alpha: 0.8)
+          ..strokeWidth = 1.5
+          ..style = PaintingStyle.stroke;
+        canvas.drawLine(Offset(cx - 8, cy), Offset(cx + 8, cy), crossPaint);
+        canvas.drawLine(Offset(cx, cy - 8), Offset(cx, cy + 8), crossPaint);
+      }
+
       final textPainter = TextPainter(
         text: TextSpan(
-          text: 'Object ${i + 1}',
-          style: const TextStyle(
-            color: Color(0xFF00FF00),
-            fontSize: 12,
+          text: '${detection.distance.toStringAsFixed(1)}m',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 14,
             fontWeight: FontWeight.bold,
-            backgroundColor: Colors.black54,
+            backgroundColor: detection.color.withValues(alpha: 0.8),
           ),
         ),
         textDirection: TextDirection.ltr,
       );
       textPainter.layout();
-      textPainter.paint(
-        canvas,
-        Offset(rect.left, rect.top - 20),
-      );
+      textPainter.paint(canvas, Offset(rect.left, rect.top - 22));
     }
   }
 
-  @override
-  bool shouldRepaint(BoundingBoxPainter oldDelegate) {
-    return oldDelegate.detections.length != detections.length ||
-        oldDelegate.imageWidth != imageWidth ||
-        oldDelegate.imageHeight != imageHeight;
+  void _drawDistanceLines(Canvas canvas, Size size) {
+    final linePaint = Paint()
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+
+    final levels = [
+      {'dist': '0.5m', 'color': const Color(0xFFC23A22), 'y': 0.85},
+      {'dist': '1.0m', 'color': const Color(0xFFD47D00), 'y': 0.65},
+      {'dist': '1.5m', 'color': const Color(0xFF1D8A4A), 'y': 0.45},
+    ];
+
+    for (final level in levels) {
+      linePaint.color =
+          (level['color'] as Color).withValues(alpha: 0.4);
+      final y = size.height * (level['y'] as double);
+
+      final path = Path();
+      path.moveTo(size.width * 0.1, y);
+      path.quadraticBezierTo(size.width * 0.5, y + 20, size.width * 0.9, y);
+      canvas.drawPath(path, linePaint);
+
+      final tp = TextPainter(
+        text: TextSpan(
+          text: level['dist'] as String,
+          style: TextStyle(
+              color: linePaint.color,
+              fontSize: 10,
+              fontWeight: FontWeight.bold),
+        ),
+        textDirection: TextDirection.ltr,
+      );
+      tp.layout();
+      tp.paint(canvas, Offset(size.width * 0.05, y - 12));
+    }
   }
+
+  void _drawCorners(Canvas canvas, Rect rect, Paint paint) {
+    const double len = 15;
+    canvas.drawLine(rect.topLeft, rect.topLeft + const Offset(len, 0), paint);
+    canvas.drawLine(rect.topLeft, rect.topLeft + const Offset(0, len), paint);
+    canvas.drawLine(
+        rect.topRight, rect.topRight + const Offset(-len, 0), paint);
+    canvas.drawLine(
+        rect.topRight, rect.topRight + const Offset(0, len), paint);
+    canvas.drawLine(
+        rect.bottomLeft, rect.bottomLeft + const Offset(len, 0), paint);
+    canvas.drawLine(
+        rect.bottomLeft, rect.bottomLeft + const Offset(0, -len), paint);
+    canvas.drawLine(
+        rect.bottomRight, rect.bottomRight + const Offset(-len, 0), paint);
+    canvas.drawLine(
+        rect.bottomRight, rect.bottomRight + const Offset(0, -len), paint);
+
+    canvas.drawRect(
+        rect,
+        paint
+          ..strokeWidth = 1
+          ..color = paint.color.withValues(alpha: 0.2));
+  }
+
+  @override
+  bool shouldRepaint(BoundingBoxPainter oldDelegate) => true;
 }
+
+// ── Reusable widgets ─────────────────────────────────────────────────────────
 
 class _InfoCard extends StatelessWidget {
   const _InfoCard({
@@ -1068,31 +1339,32 @@ class _InfoCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
+        color: const Color(0xFF1E293B),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, color: color),
-          const SizedBox(height: 8),
-          Text(
-            title,
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: const Color(0xFF607086),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(12),
             ),
+            child: Icon(icon, color: color, size: 22),
           ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            style: theme.textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w700,
-            ),
-          ),
+          const SizedBox(height: 12),
+          Text(title,
+              style: theme.textTheme.bodyMedium
+                  ?.copyWith(color: const Color(0xFF94A3B8))),
+          const SizedBox(height: 4),
+          Text(value,
+              style: theme.textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.w800, color: Colors.white)),
         ],
       ),
     );
@@ -1113,31 +1385,17 @@ class _StatusRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-
     return Row(
       children: [
-        Expanded(
-          child: Text(
-            label,
-            style: theme.textTheme.bodyMedium,
-          ),
-        ),
+        Expanded(child: Text(label, style: theme.textTheme.bodyMedium)),
         Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-          ),
-        ),
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
         const SizedBox(width: 8),
-        Text(
-          status,
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: const Color(0xFF3D4A59),
-            fontWeight: FontWeight.w600,
-          ),
-        ),
+        Text(status,
+            style: theme.textTheme.bodyMedium?.copyWith(
+                color: const Color(0xFF3D4A59), fontWeight: FontWeight.w600)),
       ],
     );
   }
@@ -1160,28 +1418,17 @@ class _ColorChannelSlider extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        SizedBox(
-          width: 48,
-          child: Text(label),
-        ),
+        SizedBox(width: 48, child: Text(label)),
         Expanded(
           child: SliderTheme(
             data: SliderTheme.of(context).copyWith(
               activeTrackColor: activeColor,
               thumbColor: activeColor,
             ),
-            child: Slider(
-              value: value,
-              min: 0,
-              max: 255,
-              onChanged: onChanged,
-            ),
+            child: Slider(value: value, min: 0, max: 255, onChanged: onChanged),
           ),
         ),
-        SizedBox(
-          width: 36,
-          child: Text(value.toInt().toString()),
-        ),
+        SizedBox(width: 36, child: Text(value.toInt().toString())),
       ],
     );
   }
