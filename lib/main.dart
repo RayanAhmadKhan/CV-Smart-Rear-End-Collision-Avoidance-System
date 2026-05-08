@@ -132,27 +132,12 @@ class _AdaptiveSizeModel {
   void update(double pixelWidth, double distanceM) {
     if (distanceM <= 0 || pixelWidth <= 0) return;
     final product = pixelWidth * distanceM;
-    // Reject obviously noisy updates when we have a stable estimate
-    if (_n >= 5) {
-      // Accept only if product is within reasonable bounds of current EWMA
-      final low = _ewma * 0.25; // allow down to 25%
-      final high = _ewma * 5.0; // allow up to 5x
-      if (product < low || product > high) {
-        // ignore outlier
-        return;
-      }
-    }
-
     _n = math.min(_n + 1, 1000000);
     if (_n == 1) {
       _ewma = product;
     } else {
       _ewma = _ewma * (1.0 - _alpha) + product * _alpha;
     }
-
-    // Prevent collapse to tiny values — keep a floor relative to default
-    final floor = _defaultProduct * 0.35;
-    if (_ewma < floor) _ewma = floor;
   }
 
   /// Estimated focalPx × W_real product
@@ -204,13 +189,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   Uint8List? _prevLuma;
   // Per-blob previous pixel-width for τ = size / Δsize computation
   final Map<String, double> _prevBlobWidths = {};
-  // Previous pixel-width for the currently locked detection (safer tracking)
-  double? _prevLockedWidth;
-  // Persistent tracks
-  final Map<int, _Track> _tracks = {};
-  int _nextTrackId = 1;
-  int? _lockedTrackId;
-  int _frameIndex = 0;
 
   // ── Object locking ──────────────────────────────────────────────────────────
   ObjectDetection? _lockedDetection;
@@ -227,6 +205,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
 
   // ── UI state ────────────────────────────────────────────────────────────────
   double? _distanceM;
+  bool _brakeApplied = false;
   SafetyState _safetyState = SafetyState.unknown;
   TrackingMode _trackingMode = TrackingMode.anyObject;
   String _sensorStatus = 'Starting';
@@ -371,7 +350,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   // ═══════════════════════════════════════════════════════════════════════════
 
   void _onFrame(CameraImage img) {
-    _frameIndex++;
     if (_processingFrame) return;
     _processingFrame = true;
     try {
@@ -381,12 +359,9 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         _focalBootstrapped = true;
       }
 
-        final candidates = _trackingMode == TrackingMode.anyObject
+      final candidates = _trackingMode == TrackingMode.anyObject
           ? _detectMotionBlobs(img)
           : _detectColorBlobs(img);
-
-        // Associate detections with persistent tracks to stabilize identity
-        _associateTracks(img, candidates);
 
       if (!mounted) return;
 
@@ -400,66 +375,53 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
             _distanceM = null;
             _detections = [];
             _collisionStatus = 'Scanning…';
+            _brakeApplied = false;
           });
           _setSafety(SafetyState.unknown);
         }
         return;
       }
 
-      // ── Match to locked object or pick nearest (using tracks) ─────────
+      // ── Match to locked object or pick nearest ───────────────────────────
       ObjectDetection? matched;
-      if (_lockedTrackId == null) {
-        if (candidates.isNotEmpty) {
-          matched = candidates.reduce((a, b) => a.distance <= b.distance ? a : b);
-          // if the matched detection corresponds to a track, lock it
-          final lockTrack = _findTrackForDetection(matched);
-          if (lockTrack != null) _lockedTrackId = lockTrack.id;
-        }
+      if (_lockedDetection == null) {
+        // Pick the NEAREST (smallest distance) candidate — the immediate threat
+        matched = candidates.reduce(
+            (a, b) => a.distance <= b.distance ? a : b);
       } else {
-        // prefer detection that matches locked track id
-        final t = _tracks[_lockedTrackId];
-        if (t == null) {
-          _lockedTrackId = null;
-        } else {
-          ObjectDetection? best;
-          double bestScore = -1.0;
-          for (final c in candidates) {
-            final dx = (c.center.dx - t.center.dx) / img.width;
-            final dy = (c.center.dy - t.center.dy) / img.width;
-            final iou = _iouRects(c.minX, c.minY, c.maxX, c.maxY, t.minX, t.minY, t.maxX, t.maxY);
-            final score = iou + (1.0 - (dx * dx + dy * dy).clamp(0.0, 1.0));
-            if (score > bestScore) {
-              bestScore = score;
-              best = c;
-            }
+        double bestScore = -1.0;
+        for (final c in candidates) {
+          final iou = _lockedDetection!.iou(c);
+          final dx =
+              (c.center.dx - _lockedDetection!.center.dx) / img.width;
+          final dy =
+              (c.center.dy - _lockedDetection!.center.dy) / img.width;
+          final score = iou + (1.0 - (dx * dx + dy * dy).clamp(0.0, 1.0));
+          if (score > bestScore) {
+            bestScore = score;
+            matched = c;
           }
-          if (best == null) {
-            _missingFrames++;
-            if (_missingFrames >= _maxMissing) {
-              _lockedTrackId = null;
-              _missingFrames = 0;
-              _smoother.clear();
-            }
-            return;
+        }
+        final iouOk = _lockedDetection!.iou(matched!) >= _iouThresh;
+        final dx =
+            (matched.center.dx - _lockedDetection!.center.dx) / img.width;
+        final dy =
+            (matched.center.dy - _lockedDetection!.center.dy) / img.width;
+        final centreOk =
+            (dx * dx + dy * dy) <= _centreThresh * _centreThresh;
+
+        if (!iouOk && !centreOk) {
+          _missingFrames++;
+          if (_missingFrames >= _maxMissing) {
+            _lockedDetection =
+                candidates.reduce((a, b) => a.distance <= b.distance ? a : b);
+            _missingFrames = 0;
+            _smoother.clear();
           }
-          final iouOk = _iouRects(best.minX, best.minY, best.maxX, best.maxY, t.minX, t.minY, t.maxX, t.maxY) >= _iouThresh;
-          final dx = (best.center.dx - t.center.dx) / img.width;
-          final dy = (best.center.dy - t.center.dy) / img.width;
-          final centreOk = (dx * dx + dy * dy) <= _centreThresh * _centreThresh;
-          if (!iouOk && !centreOk) {
-            _missingFrames++;
-            if (_missingFrames >= _maxMissing) {
-              _lockedTrackId = null;
-              _missingFrames = 0;
-              _smoother.clear();
-            }
-            return;
-          }
-          matched = best;
+          return;
         }
       }
 
-      // Reflect matched detection into _lockedDetection for UI overlay
       _lockedDetection = matched;
       _missingFrames = 0;
 
@@ -477,6 +439,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         _detections = [display];
         _distanceM = smooth;
         _collisionStatus = 'Tracking Object';
+        _brakeApplied = smooth < 0.5;
       });
 
       if (smooth < _dangerM) {
@@ -492,128 +455,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     } finally {
       _processingFrame = false;
     }
-  }
-
-  // Helper to compute IoU between two rects (given as coords)
-  double _iouRects(double aMinX, double aMinY, double aMaxX, double aMaxY,
-      double bMinX, double bMinY, double bMaxX, double bMaxY) {
-    final iL = math.max(aMinX, bMinX);
-    final iT = math.max(aMinY, bMinY);
-    final iR = math.min(aMaxX, bMaxX);
-    final iB = math.min(aMaxY, bMaxY);
-    if (iR <= iL || iB <= iT) return 0.0;
-    final inter = (iR - iL) * (iB - iT);
-    final union = (aMaxX - aMinX) * (aMaxY - aMinY) +
-        (bMaxX - bMinX) * (bMaxY - bMinY) -
-        inter;
-    return union > 0 ? inter / union : 0.0;
-  }
-
-  // Find a track that best matches this detection (by IoU or proximity)
-  _Track? _findTrackForDetection(ObjectDetection d) {
-    _Track? best;
-    double bestScore = -1.0;
-    for (final t in _tracks.values) {
-      final iou = _iouRects(d.minX, d.minY, d.maxX, d.maxY, t.minX, t.minY, t.maxX, t.maxY);
-      final dx = (d.center.dx - t.center.dx);
-      final dy = (d.center.dy - t.center.dy);
-      final dist = math.sqrt(dx * dx + dy * dy);
-      final score = iou - (dist / (t.width + 1.0));
-      if (score > bestScore) {
-        bestScore = score;
-        best = t;
-      }
-    }
-    if (bestScore < 0.0) return null;
-    return best;
-  }
-
-  // Associate detections with persistent tracks, compute stabilized distance
-  void _associateTracks(CameraImage img, List<ObjectDetection> detections) {
-    // Mark tracks as unseen initially
-    final seenTrackIds = <int>{};
-    final usedTracks = <int>{};
-
-    for (int i = 0; i < detections.length; i++) {
-      final d = detections[i];
-      final pixW = (d.maxX - d.minX).clamp(1.0, img.width.toDouble());
-
-      // try to find an existing track
-      final match = _findTrackForDetection(d);
-      if (match != null && !_tracks.isEmpty) {
-        // update track
-        final track = match;
-        usedTracks.add(track.id);
-        // compute TTC using track.prevWidth
-        double? dTTC;
-        final prevW = track.prevWidth > 0 ? track.prevWidth : pixW;
-        if (prevW > 1.0) {
-          final growthRatio = (pixW - prevW) / prevW;
-          if (growthRatio > 0.015) {
-            final tau = 1.0 / growthRatio;
-            dTTC = (tau * 0.033 * 1.15).clamp(0.08, 14.0);
-          }
-        }
-
-        final dApp = (_sizeModel.focalSizeProduct / pixW).clamp(0.15, 14.0);
-        double dist;
-        if (dTTC != null && (dTTC - dApp).abs() / dApp < 4.0) {
-          final baseWeight = _sizeModel.sampleCount < 8 ? 0.5 : 0.28;
-          final proximityFactor = dApp < 1.0 ? 0.35 : 1.0;
-          double ttcWeight = (baseWeight * proximityFactor).clamp(0.05, 0.8);
-          if (dTTC > dApp * 2.5) ttcWeight *= 0.5;
-          dist = dTTC * ttcWeight + dApp * (1.0 - ttcWeight);
-          // update adaptive model with TTC if consistent
-          _sizeModel.update(pixW, dTTC);
-        } else {
-          dist = dApp;
-        }
-
-        // update track geometry and history
-        track.minX = d.minX;
-        track.maxX = d.maxX;
-        track.minY = d.minY;
-        track.maxY = d.maxY;
-        track.prevWidth = pixW;
-        track.lastSeen = _frameIndex;
-        track.age += 1;
-
-        // replace detection with new one containing stabilized distance
-        detections[i] = ObjectDetection(
-          minX: d.minX,
-          maxX: d.maxX,
-          minY: d.minY,
-          maxY: d.maxY,
-          distance: dist,
-          color: _distColor(dist),
-        );
-        seenTrackIds.add(track.id);
-      } else {
-        // create a new track
-        final id = _nextTrackId++;
-        final track = _Track(id, d.minX, d.maxX, d.minY, d.maxY,
-            prevWidth: pixW, lastSeen: _frameIndex);
-        _tracks[id] = track;
-        // detection distance = apparent model until track builds history
-        final dApp = (_sizeModel.focalSizeProduct / pixW).clamp(0.15, 14.0);
-        detections[i] = ObjectDetection(
-          minX: d.minX,
-          maxX: d.maxX,
-          minY: d.minY,
-          maxY: d.maxY,
-          distance: dApp,
-          color: _distColor(dApp),
-        );
-        seenTrackIds.add(id);
-      }
-    }
-
-    // prune old tracks
-    final stale = <int>[];
-    _tracks.forEach((id, t) {
-      if (t.lastSeen < _frameIndex - _maxMissing) stale.add(id);
-    });
-    for (final id in stale) _tracks.remove(id);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -651,79 +492,34 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         (_sizeModel.focalSizeProduct / pixW).clamp(0.15, 14.0);
 
     // ── (B) Temporal scaling / optical flow ──────────────────────────────
-    // Build a stable key from the blob's normalised grid centre (coarse)
+    // Build a stable key from the blob's normalised grid centre
     final blobKey =
         '${((minX + maxX) / 2 / img.width * 8).round()}_${((minY + maxY) / 2 / img.height * 8).round()}';
     double? dTTC;
-    // Prefer using the locked detection tracker to avoid blob-key swapping
-    bool usedLockedTracker = false;
-    if (_lockedDetection != null) {
-      // compute IoU between this candidate bbox and the locked detection
-      final left = math.max(minX, _lockedDetection!.minX);
-      final top = math.max(minY, _lockedDetection!.minY);
-      final right = math.min(maxX, _lockedDetection!.maxX);
-      final bottom = math.min(maxY, _lockedDetection!.maxY);
-      final iw = right - left;
-      final ih = bottom - top;
-      if (iw > 0 && ih > 0) {
-        final inter = iw * ih;
-        final union = (pixW * pixH) + (_lockedDetection!.area) - inter;
-        final iou = union > 0 ? inter / union : 0.0;
-        if (iou >= 0.15) {
-          // treat as same object — use locked width tracker
-          usedLockedTracker = true;
-          final prevW = _prevLockedWidth ?? pixW;
-          if (prevW > 1.0) {
-            final growthRatio = (pixW - prevW) / prevW;
-            if (growthRatio > 0.015) {
-              final tau = 1.0 / growthRatio;
-              dTTC = (tau * 0.033 * 1.2).clamp(0.08, 14.0);
-              if ((dTTC - dApparent).abs() / dApparent < 4.0) {
-                _sizeModel.update(pixW, dTTC);
-              } else {
-                dTTC = null;
-              }
-            }
-          }
-          _prevLockedWidth = pixW;
-        }
-      }
-    }
+    if (_prevBlobWidths.containsKey(blobKey)) {
+      final prevW = _prevBlobWidths[blobKey]!;
+      final deltaW = (pixW - prevW).abs();
+      final growth = pixW - prevW; // positive when object grows
+      // Be more sensitive: allow smaller growths and only feed model when
+      // the object is actually increasing in pixel size (approaching).
+      if (deltaW > 0.2 && growth > 0.0) {
+        final tau = prevW / growth; // frames of time-to-contact
+        // Use a slightly larger proxy velocity to avoid underestimation.
+        dTTC = (tau * 0.033 * 1.2).clamp(0.12, 14.0);
 
-    if (!usedLockedTracker) {
-      if (_prevBlobWidths.containsKey(blobKey)) {
-        final prevW = _prevBlobWidths[blobKey]!;
-        if (prevW > 1.0) {
-          final growthRatio = (pixW - prevW) / prevW; // positive when object grows
-          if (growthRatio > 0.03) {
-            final tau = 1.0 / growthRatio; // frames of time-to-contact
-            dTTC = (tau * 0.033 * 1.1).clamp(0.10, 14.0);
-            if ((dTTC - dApparent).abs() / dApparent < 4.0) {
-              _sizeModel.update(pixW, dTTC);
-            } else {
-              dTTC = null;
-            }
-          }
-        }
+        // Feed this TTC-derived distance back into the adaptive model
+        // but limit noisy updates by only updating when growth is significant.
+        _sizeModel.update(pixW, dTTC);
       }
-      _prevBlobWidths[blobKey] = pixW;
     }
+    _prevBlobWidths[blobKey] = pixW;
 
     // ── Fuse (A) and (B) ─────────────────────────────────────────────────
-    // Use a dynamic weight that: (a) favors TTC early while model is immature,
-    // (b) favors apparent-size when very close (pixel measurements are reliable),
-    // (c) rejects TTC when it contradicts apparent-size by a large margin.
+    // If we have a TTC measurement, weight it 40% if the model is immature
+    // (n < 10) and 20% once it has converged.
     double dist;
     if (dTTC != null) {
-      double baseWeight = _sizeModel.sampleCount < 8 ? 0.5 : 0.28;
-      // if apparent estimate is very close (<1m), reduce TTC weight
-      final proximityFactor = dApparent < 1.0 ? 0.35 : 1.0;
-      double ttcWeight = (baseWeight * proximityFactor).clamp(0.05, 0.8);
-
-      // If TTC suggests a much larger distance than apparent (possible overshoot),
-      // reduce TTC influence.
-      if (dTTC > dApparent * 2.5) ttcWeight *= 0.5;
-
+      final ttcWeight = _sizeModel.sampleCount < 10 ? 0.50 : 0.18;
       dist = dTTC * ttcWeight + dApparent * (1.0 - ttcWeight);
     } else {
       dist = dApparent;
@@ -944,6 +740,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       _distanceM = null;
       _collisionStatus = 'Scanning…';
       _safetyState = SafetyState.unknown;
+      _brakeApplied = false;
     });
     _pulseCtrl.stop();
     _pulseCtrl.reset();
@@ -1290,18 +1087,51 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
               ],
             ),
           ),
-          Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            decoration: BoxDecoration(
-              color: _stateColor.withValues(alpha: 0.20),
-              borderRadius: BorderRadius.circular(14),
-            ),
-            child: Text(
-              _stateLabel,
-              style: theme.textTheme.labelLarge
-                  ?.copyWith(color: _stateColor, fontWeight: FontWeight.w800),
-            ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: _stateColor.withValues(alpha: 0.20),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Text(
+                  _stateLabel,
+                  style: theme.textTheme.labelLarge
+                      ?.copyWith(color: _stateColor, fontWeight: FontWeight.w800),
+                ),
+              ),
+              const SizedBox(height: 8),
+              // Brake pill
+              if (_brakeApplied)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFC23A22),
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFFC23A22).withOpacity(0.25),
+                        blurRadius: 8,
+                        offset: const Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.car_repair, color: Colors.white, size: 14),
+                      const SizedBox(width: 6),
+                      Text('Brake Applied',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                              color: Colors.white, fontWeight: FontWeight.w900)),
+                    ],
+                  ),
+                ),
+            ],
           ),
         ],
       ),
@@ -1756,22 +1586,4 @@ class _ColorChannelSlider extends StatelessWidget {
       ],
     );
   }
-}
-
-// Simple track structure for persistent object identity
-class _Track {
-  final int id;
-  double minX, maxX, minY, maxY;
-  double prevWidth;
-  int lastSeen;
-  int age;
-
-  _Track(this.id, this.minX, this.maxX, this.minY, this.maxY,
-      {required this.prevWidth, required this.lastSeen})
-      : age = 0;
-
-  double get width => (maxX - minX).abs();
-  double get height => (maxY - minY).abs();
-  double get area => width * height;
-  Offset get center => Offset((minX + maxX) / 2, (minY + maxY) / 2);
 }
