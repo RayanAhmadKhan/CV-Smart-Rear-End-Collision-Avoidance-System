@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
@@ -48,6 +50,19 @@ class ObjectDetection {
   }) : width = (maxX - minX).abs();
 
   double get height => (maxY - minY).abs();
+  double get area => width * height;
+  Offset get center => Offset((minX + maxX) * 0.5, (minY + maxY) * 0.5);
+
+  double iou(ObjectDetection other) {
+    final left = math.max(minX, other.minX);
+    final top = math.max(minY, other.minY);
+    final right = math.min(maxX, other.maxX);
+    final bottom = math.min(maxY, other.maxY);
+    if (right <= left || bottom <= top) return 0.0;
+    final inter = (right - left) * (bottom - top);
+    final union = area + other.area - inter;
+    return union > 0 ? inter / union : 0.0;
+  }
 }
 
 class RearDistanceDashboard extends StatefulWidget {
@@ -61,8 +76,10 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const double _warningThresholdM = 1.5;
   static const double _dangerThresholdM = 0.8;
-  static const double _knownObjectWidthM = 0.5;
-  static const double _calibratedFocalLength = 0.62;
+  static const int _maxMissedFrames = 7;
+  static const double _lockIouThreshold = 0.25;
+  static const double _lockCenterThreshold = 0.18;
+  static const double _initialProductPxM = 620.0;
 
   CameraController? _cameraController;
   bool _isCameraReady = false;
@@ -77,8 +94,13 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   double _colorTolerance = 75;
   Uint8List? _previousLuma;
   List<ObjectDetection> _detections = [];
-
-  late final AnimationController _dangerPulseController;
+  ObjectDetection? _lockedDetection;
+  int _missedFrames = 0;
+  double _distanceEwma = 2.5;
+  bool _hasDistanceEwma = false;
+  double _adaptiveProductPxM = _initialProductPxM;
+  int _adaptiveSamples = 0;
+  double? _prevDetectionWidth;
 
   @override
   void initState() {
@@ -190,7 +212,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     _isProcessingFrame = true;
 
     try {
-      final detections = _trackingMode == TrackingMode.anyObject
+        final detections = _trackingMode == TrackingMode.anyObject
           ? _detectAnyObject(image)
           : _detectTargetColorObject(image);
 
@@ -200,6 +222,12 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       }
 
       if (detections.isEmpty) {
+        _missedFrames++;
+        if (_missedFrames >= _maxMissedFrames) {
+          _lockedDetection = null;
+          _prevDetectionWidth = null;
+          _hasDistanceEwma = false;
+        }
         setState(() {
           _distanceM = null;
           _collisionStatus = 'No target';
@@ -209,30 +237,32 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         return;
       }
 
+      _missedFrames = 0;
+
+      final locked = _pickLockedDetection(detections, image);
+      if (locked == null) {
+        setState(() {
+          _distanceM = null;
+          _collisionStatus = 'No stable target';
+          _detections = detections;
+        });
+        _updateSafetyState(SafetyState.unknown);
+        return;
+      }
+
+      _lockedDetection = locked;
+
+      final estimatedDistance = _estimateDistanceFromLocked(locked, image.width);
+
       setState(() {
-        _detections = detections;
+        _distanceM = estimatedDistance;
+        _collisionStatus = 'Tracking stable target';
+        _detections = [locked];
       });
 
-      // Calculate distances for all detections
-      final distances = detections.map((detection) {
-        final objectWidthRatio = detection.width / image.width;
-        return (_knownObjectWidthM * _calibratedFocalLength) / objectWidthRatio;
-      }).toList();
-
-      // Find nearest object
-      final nearestDistance = distances.reduce((a, b) => a < b ? a : b);
-      final clampedDistance = nearestDistance.clamp(0.2, 10.0);
-
-      setState(() {
-        _distanceM = clampedDistance;
-        _collisionStatus = _trackingMode == TrackingMode.anyObject
-            ? 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}'
-            : 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}';
-      });
-
-      if (clampedDistance < _dangerThresholdM) {
+      if (estimatedDistance < _dangerThresholdM) {
         _updateSafetyState(SafetyState.danger);
-      } else if (clampedDistance < _warningThresholdM) {
+      } else if (estimatedDistance < _warningThresholdM) {
         _updateSafetyState(SafetyState.warning);
       } else {
         _updateSafetyState(SafetyState.safe);
@@ -254,26 +284,25 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       return [];
     }
 
-    // Motion detection
-    int minX = width;
-    int maxX = 0;
-    int minY = height;
-    int maxY = 0;
-    int motionPixels = 0;
+    // Grid motion map to separate independent moving regions.
+    const int cellSize = 12;
+    final cols = width ~/ cellSize;
+    final rows = height ~/ cellSize;
+    final active = List<bool>.filled(cols * rows, false);
 
-    const int motionThreshold = 20;
+    const int motionThreshold = 14;
 
-    for (int y = 0; y < height; y += 4) {
-      for (int x = 0; x < width; x += 4) {
+    for (int y = 0; y < height; y += 6) {
+      for (int x = 0; x < width; x += 6) {
         final index = y * yBytesPerRow + x;
         if (index < yPlane.length && index < previous.length) {
           final diff = (yPlane[index] - previous[index]).abs();
           if (diff > motionThreshold) {
-            motionPixels++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
+            final cx = x ~/ cellSize;
+            final cy = y ~/ cellSize;
+            if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
+              active[cy * cols + cx] = true;
+            }
           }
         }
       }
@@ -281,67 +310,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
 
     _previousLuma = Uint8List.fromList(yPlane);
 
-    // If motion detected
-    if (motionPixels > 20 && maxX > minX && maxY > minY) {
-      return [ObjectDetection(
-        minX: minX.toDouble(),
-        maxX: maxX.toDouble(),
-        minY: minY.toDouble(),
-        maxY: maxY.toDouble(),
-      )];
-    }
-
-    // Strong edge detection for static objects using Sobel-like approach
-    minX = width;
-    maxX = 0;
-    minY = height;
-    maxY = 0;
-    int edgePixels = 0;
-
-    const int step = 3;
-    const int strongEdgeThreshold = 40;
-
-    for (int y = step; y < height - step; y += step) {
-      for (int x = step; x < width - step; x += step) {
-        final idx = y * yBytesPerRow + x;
-        if (idx + step < yPlane.length) {
-          final center = yPlane[idx];
-          
-          // Sobel-like gradients
-          final gx = (yPlane[idx + step] - yPlane[idx - step]).abs();
-          final gy = (yPlane[idx + (step * yBytesPerRow)] - yPlane[idx - (step * yBytesPerRow)]).abs();
-          
-          final edgeStrength = (gx + gy) ~/ 2;
-          
-          // Only detect strong edges
-          if (edgeStrength > strongEdgeThreshold) {
-            edgePixels++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-        }
-      }
-    }
-
-    // Require significant edge regions
-    if (edgePixels > 40 && maxX > minX && maxY > minY) {
-      final widthPx = maxX - minX;
-      final heightPx = maxY - minY;
-      
-      // Filter out very thin or elongated detections (likely noise)
-      if (widthPx > 20 && heightPx > 20) {
-        return [ObjectDetection(
-          minX: minX.toDouble(),
-          maxX: maxX.toDouble(),
-          minY: minY.toDouble(),
-          maxY: maxY.toDouble(),
-        )];
-      }
-    }
-
-    return [];
+    return _clusterObjects(active, cols, rows, minPixels: 4, cellSize: cellSize);
   }
 
   List<ObjectDetection> _detectTargetColorObject(CameraImage image) {
@@ -358,19 +327,18 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     final vBytesPerRow = image.planes[2].bytesPerRow;
     final vBytesPerPixel = image.planes[2].bytesPerPixel ?? 1;
 
-    int minX = width;
-    int maxX = 0;
-    int minY = height;
-    int maxY = 0;
-    int targetPixels = 0;
+    const int cellSize = 10;
+    final cols = width ~/ cellSize;
+    final rows = height ~/ cellSize;
+    final active = List<bool>.filled(cols * rows, false);
 
     final targetR = _targetColor.red;
     final targetG = _targetColor.green;
     final targetB = _targetColor.blue;
     final maxDistanceSquared = _colorTolerance * _colorTolerance;
 
-    for (int y = 0; y < height; y += 4) {
-      for (int x = 0; x < width; x += 4) {
+    for (int y = 0; y < height; y += 6) {
+      for (int x = 0; x < width; x += 6) {
         final yIndex = y * yBytesPerRow + x;
         final uvRow = y ~/ 2;
         final uvCol = x ~/ 2;
@@ -398,35 +366,187 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         final colorDistanceSquared = (dr * dr) + (dg * dg) + (db * db);
 
         if (colorDistanceSquared <= maxDistanceSquared) {
-          targetPixels++;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
+          final cx = x ~/ cellSize;
+          final cy = y ~/ cellSize;
+          if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
+            active[cy * cols + cx] = true;
+          }
         }
       }
     }
 
-    if (targetPixels > 15 && maxX > minX && maxY > minY) {
-      return [ObjectDetection(
-        minX: minX.toDouble(),
-        maxX: maxX.toDouble(),
-        minY: minY.toDouble(),
-        maxY: maxY.toDouble(),
-      )];
-    }
-
-    return [];
+    return _clusterObjects(active, cols, rows, minPixels: 3, cellSize: cellSize);
   }
 
   List<ObjectDetection> _clusterObjects(
     List<bool> pixelMap,
     int width,
-    int height,
-    int minPixels,
-  ) {
-    // This function is no longer used but kept for compatibility
-    return [];
+    int height, {
+    required int minPixels,
+    required int cellSize,
+  }) {
+    final visited = List<bool>.filled(pixelMap.length, false);
+    final out = <ObjectDetection>[];
+
+    for (int idx = 0; idx < pixelMap.length; idx++) {
+      if (!pixelMap[idx] || visited[idx]) continue;
+
+      final queue = <int>[idx];
+      visited[idx] = true;
+      int count = 0;
+      int minGX = idx % width;
+      int maxGX = minGX;
+      int minGY = idx ~/ width;
+      int maxGY = minGY;
+
+      while (queue.isNotEmpty && count < 500) {
+        final cur = queue.removeLast();
+        count++;
+        final x = cur % width;
+        final y = cur ~/ width;
+        if (x < minGX) minGX = x;
+        if (x > maxGX) maxGX = x;
+        if (y < minGY) minGY = y;
+        if (y > maxGY) maxGY = y;
+
+        for (int dy = -1; dy <= 1; dy++) {
+          for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            final nx = x + dx;
+            final ny = y + dy;
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+            final ni = ny * width + nx;
+            if (pixelMap[ni] && !visited[ni]) {
+              visited[ni] = true;
+              queue.add(ni);
+            }
+          }
+        }
+      }
+
+      if (count < minPixels) continue;
+
+      final minX = (minGX * cellSize).toDouble();
+      final maxX = ((maxGX + 1) * cellSize).toDouble();
+      final minY = (minGY * cellSize).toDouble();
+      final maxY = ((maxGY + 1) * cellSize).toDouble();
+      final frameMaxX = (width * cellSize).toDouble();
+      final frameMaxY = (height * cellSize).toDouble();
+
+      final boxW = maxX - minX;
+      final boxH = maxY - minY;
+      if (boxW < 24 || boxH < 24) continue;
+      if (boxW * boxH < 1000) continue;
+
+      // Expand slightly to capture full object contour instead of fragments.
+      final padX = math.max(8.0, boxW * 0.10);
+      final padY = math.max(8.0, boxH * 0.10);
+      out.add(ObjectDetection(
+        minX: (minX - padX).clamp(0.0, frameMaxX),
+        maxX: (maxX + padX).clamp(0.0, frameMaxX),
+        minY: (minY - padY).clamp(0.0, frameMaxY),
+        maxY: (maxY + padY).clamp(0.0, frameMaxY),
+      ));
+    }
+
+    out.sort((a, b) => b.area.compareTo(a.area));
+    return out;
+  }
+
+  ObjectDetection? _pickLockedDetection(List<ObjectDetection> detections, CameraImage image) {
+    if (detections.isEmpty) return null;
+    if (_lockedDetection == null) {
+      // Nearest proxy without hard calibration: largest width candidate.
+      return detections.reduce((a, b) => a.width >= b.width ? a : b);
+    }
+
+    ObjectDetection? best;
+    double bestScore = -1.0;
+    for (final d in detections) {
+      final iou = _lockedDetection!.iou(d);
+      final dx = (d.center.dx - _lockedDetection!.center.dx) / image.width;
+      final dy = (d.center.dy - _lockedDetection!.center.dy) / image.width;
+      final centerScore = 1.0 - (dx * dx + dy * dy).clamp(0.0, 1.0);
+      final score = (iou * 0.7) + (centerScore * 0.3);
+      if (score > bestScore) {
+        best = d;
+        bestScore = score;
+      }
+    }
+
+    if (best == null) return null;
+    final iouOk = _lockedDetection!.iou(best) >= _lockIouThreshold;
+    final dx = (best.center.dx - _lockedDetection!.center.dx) / image.width;
+    final dy = (best.center.dy - _lockedDetection!.center.dy) / image.width;
+    final centerOk = (dx * dx + dy * dy) <= (_lockCenterThreshold * _lockCenterThreshold);
+
+    if (!iouOk && !centerOk) {
+      return detections.reduce((a, b) => a.width >= b.width ? a : b);
+    }
+    return best;
+  }
+
+  double _estimateDistanceFromLocked(ObjectDetection detection, int imageWidth) {
+    final widthPx = detection.width.clamp(12.0, imageWidth.toDouble());
+    double rawDistance = (_adaptiveProductPxM / widthPx).clamp(0.18, 12.0);
+
+    // CRITICAL: Enforce direction consistency so distance always follows width properly.
+    // If object gets wider (closer), distance MUST decrease. If narrower (farther), distance MUST increase.
+    final prevWidth = _prevDetectionWidth;
+    final prevDist = _hasDistanceEwma ? _distanceEwma : null;
+
+    if (prevWidth != null && prevDist != null && prevWidth > 10.0) {
+      final widthRatio = widthPx / prevWidth;
+      // If width increased (object closer), ensure distance decreased
+      if (widthRatio > 1.02) {
+        if (rawDistance > prevDist) {
+          rawDistance = prevDist * 0.96;
+        }
+      }
+      // If width decreased (object farther), ensure distance increased
+      if (widthRatio < 0.98) {
+        if (rawDistance < prevDist) {
+          rawDistance = prevDist * 1.04;
+        }
+      }
+    }
+
+    // Keep the model adaptive, but much more conservative than the previous
+    // correction-heavy version so the estimate follows the apparent size more
+    // directly when you move closer or farther away.
+    if (_hasDistanceEwma) {
+      final observedProduct = widthPx * rawDistance;
+      final boundedObs = observedProduct
+          .clamp(_adaptiveProductPxM * 0.85, _adaptiveProductPxM * 1.15)
+          .toDouble();
+      _adaptiveProductPxM = _adaptiveProductPxM * 0.97 + boundedObs * 0.03;
+    }
+    _adaptiveSamples = math.min(100000, _adaptiveSamples + 1);
+
+    // Smooth output while preserving responsive behavior.
+    if (!_hasDistanceEwma) {
+      _distanceEwma = rawDistance;
+      _hasDistanceEwma = true;
+    } else {
+      // Shorter distances need faster response, so tighten smoothing for close range.
+      final alpha = rawDistance < 1.2 ? 0.25 : 0.15;
+      _distanceEwma = (_distanceEwma * (1.0 - alpha)) + (rawDistance * alpha);
+    }
+
+    _prevDetectionWidth = widthPx;
+    return _distanceEwma.clamp(0.18, 12.0);
+  }
+
+  void _resetTrackingState() {
+    _distanceM = null;
+    _collisionStatus = 'Scanning';
+    _previousLuma = null;
+    _detections = [];
+    _lockedDetection = null;
+    _missedFrames = 0;
+    _prevDetectionWidth = null;
+    _hasDistanceEwma = false;
+    _distanceEwma = 2.5;
   }
 
   void _updateSafetyState(SafetyState nextState) {
@@ -686,10 +806,8 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                         final selectedMode = selection.first;
                         setState(() {
                           _trackingMode = selectedMode;
-                          _distanceM = null;
+                          _resetTrackingState();
                           _collisionStatus = 'Mode switched';
-                          _previousLuma = null;
-                          _detections = [];
                         });
                       },
                     ),
