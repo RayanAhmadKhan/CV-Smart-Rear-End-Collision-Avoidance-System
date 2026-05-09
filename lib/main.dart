@@ -1,24 +1,3 @@
-// ============================================================================
-//  Smart Rear Monitor — Autonomous Edition
-//  Senior Computer Vision Engineer refactor
-//
-//  Distance engine:
-//    • NO manual calibration, NO reference object width.
-//    • Autonomous focal-length bootstrap from EXIF / sensor metadata on first run,
-//      falling back to a physics-derived default (f ≈ 0.8 × imageWidth).
-//    • Optical-flow feature tracking (Lucas-Kanade style sparse flow on luma grid)
-//      extracts per-blob "time-to-collision" τ = size / Δsize across consecutive frames.
-//    • Apparent-size gradient fusion: combines τ with a per-camera focal model:
-//        distance = focalPx × physicalEstimate / pixelWidth
-//      where physicalEstimate comes from an ADAPTIVE prior that self-tunes via a
-//      Kalman-like running mean of (pixelWidth × distance_from_τ) — eliminating
-//      the need for a known object size after just a few seconds of observation.
-//    • Nearest-object logic: all blobs sorted by estimated distance; only the
-//      closest (smallest Z) is displayed and drives alerts.
-//    • 30-FPS optimised: frame skip guard, 8-px stride luma scan, grid-BFS on
-//      10 × 10 cells, all work done in isolate-safe synchronous Dart.
-// ============================================================================
-
 import 'dart:typed_data';
 import 'dart:math' as math;
 
@@ -31,9 +10,6 @@ void main() {
   runApp(const RearCollisionMonitorApp());
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  App root
-// ═══════════════════════════════════════════════════════════════════════════════
 
 class RearCollisionMonitorApp extends StatelessWidget {
   const RearCollisionMonitorApp({super.key});
@@ -56,9 +32,6 @@ class RearCollisionMonitorApp extends StatelessWidget {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Domain types
-// ═══════════════════════════════════════════════════════════════════════════════
 
 enum SafetyState { safe, warning, danger, unknown }
 
@@ -96,7 +69,6 @@ class ObjectDetection {
   }
 }
 
-// ─── Exponential-weighted moving average smoother ────────────────────────────
 
 class _EWMASmoother {
   final double alpha; // 0 < alpha <= 1; larger = faster response
@@ -113,17 +85,11 @@ class _EWMASmoother {
   bool get hasValue => _value != null;
 }
 
-// ─── Adaptive prior for object-size estimation ───────────────────────────────
-//
-// Every time we have a reliable τ-based distance measurement we record the
-// product (pixelWidth × distance).  The running mean of this product is our
-// adaptive focal·physicalSize estimate.  It converges quickly (typically within
-// 3-5 frames once the camera is moving) and is stored across sessions.
 
 class _AdaptiveSizeModel {
   // EWMA-based focal·size product estimator with simple confidence
   static const double _defaultProduct = 480.0;
-  double _ewma = _defaultProduct; // running estimate of focalPx * W_real
+  double _ewma = _defaultProduct; // estimate of focalPx * W_real
   int _n = 0;
   final double _alpha;
 
@@ -140,13 +106,10 @@ class _AdaptiveSizeModel {
     }
   }
 
-  /// Estimated focalPx × W_real product
   double get focalSizeProduct => _n < 2 ? _defaultProduct : _ewma;
 
-  /// Number of samples observed
   int get sampleCount => _n;
 
-  /// Simple confidence metric in [0,1]
   double get confidence => (_n >= 8) ? 1.0 : (_n / 8.0);
 
   Map<String, dynamic> toJson() => {'ewma': _ewma, 'n': _n};
@@ -157,9 +120,7 @@ class _AdaptiveSizeModel {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Main dashboard
-// ═══════════════════════════════════════════════════════════════════════════════
+//dashboard 
 
 class RearDistanceDashboard extends StatefulWidget {
   const RearDistanceDashboard({super.key});
@@ -170,40 +131,33 @@ class RearDistanceDashboard extends StatefulWidget {
 
 class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-  // ── Safety thresholds (metres) ──────────────────────────────────────────────
+  
+  // threshold 
   static const double _warnM = 1.8;
   static const double _dangerM = 0.7;
 
-  // ── Camera focal length (pixels) ───────────────────────────────────────────
-  // Bootstrap value — overridden once we read imageWidth from the first frame.
-  // Uses the pinhole model: focalPx ≈ 0.8 × imageWidth for most smartphone
-  // cameras at medium resolution (≈ 1280 px wide → f ≈ 1024 px).
   static const double _focalFraction = 0.80;
   double _focalPx = 1024.0; // updated on first frame
   bool _focalBootstrapped = false;
 
-  // ── Autonomous size model ───────────────────────────────────────────────────
   final _AdaptiveSizeModel _sizeModel = _AdaptiveSizeModel();
 
-  // ── Optical-flow state (sparse luma grid) ──────────────────────────────────
   Uint8List? _prevLuma;
   // Per-blob previous pixel-width for τ = size / Δsize computation
   final Map<String, double> _prevBlobWidths = {};
 
-  // ── Object locking ──────────────────────────────────────────────────────────
   ObjectDetection? _lockedDetection;
   int _missingFrames = 0;
   static const int _maxMissing = 8;
   static const double _iouThresh = 0.15;
   static const double _centreThresh = 0.30;
-
-  // ── Camera state ────────────────────────────────────────────────────────────
+// camera control 
   CameraController? _camera;
   bool _cameraReady = false;
   bool _streaming = false;
   bool _processingFrame = false;
 
-  // ── UI state ────────────────────────────────────────────────────────────────
+//ui
   double? _distanceM;
   bool _brakeApplied = false;
   SafetyState _safetyState = SafetyState.unknown;
@@ -214,21 +168,16 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   double _colorTolerance = 75;
   List<ObjectDetection> _detections = [];
 
-  // ── Distance smoother ───────────────────────────────────────────────────────
   final _EWMASmoother _smoother = _EWMASmoother(alpha: 0.30);
 
   late final AnimationController _pulseCtrl;
 
-  // ── Depth-line labels (approximate heuristic guide-lines) ──────────────────
-  // These are visual guide-lines painted on the camera overlay, they do NOT
-  // affect the distance calculation.
   static const List<Map<String, dynamic>> _guideLines = [
     {'label': '0.5m', 'color': Color(0xFFC23A22), 'yFrac': 0.85},
     {'label': '1.0m', 'color': Color(0xFFD47D00), 'yFrac': 0.65},
     {'label': '1.5m', 'color': Color(0xFF1D8A4A), 'yFrac': 0.45},
   ];
 
-  // ── Persistence key ─────────────────────────────────────────────────────────
   static const String _prefKey = 'adaptiveSizeModel_v2';
 
   @override
@@ -246,8 +195,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_prefKey);
       if (raw != null) {
-        // Minimal JSON parse without dart:convert dependency
-        // Support legacy ('sum') and new ('ewma') keys.
+
         final ewmaMatch = RegExp(r'"ewma":([\d.eE+\-]+)').firstMatch(raw);
         final sumMatch = RegExp(r'"sum":([\d.eE+\-]+)').firstMatch(raw);
         final nMatch = RegExp(r'"n":(\d+)').firstMatch(raw);
@@ -293,10 +241,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     super.dispose();
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Camera initialisation
-  // ═══════════════════════════════════════════════════════════════════════════
-
+// camera initialization
   Future<void> _initCamera() async {
     try {
       final cameras = await availableCameras();
@@ -310,7 +255,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       );
       final ctrl = CameraController(
         cam,
-        ResolutionPreset.medium, // ~1280×720 — good balance of speed & detail
+        ResolutionPreset.medium, // ~1280×720 
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
@@ -345,10 +290,7 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     });
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Frame processing pipeline
-  // ═══════════════════════════════════════════════════════════════════════════
-
+//frame processing and detection
   void _onFrame(CameraImage img) {
     if (_processingFrame) return;
     _processingFrame = true;
@@ -382,7 +324,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         return;
       }
 
-      // ── Match to locked object or pick nearest ───────────────────────────
       ObjectDetection? matched;
       if (_lockedDetection == null) {
         // Pick the NEAREST (smallest distance) candidate — the immediate threat
@@ -457,25 +398,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Autonomous distance computation
-  //  Two complementary approaches fused together:
-  //
-  //  (A) APPARENT-SIZE MODEL  (primary)
-  //      Uses the pinhole formula: D = (focalPx × W_real) / W_pixels
-  //      W_real is unknown, but the _AdaptiveSizeModel tracks
-  //      (W_pixels × D_ttc) products to infer it autonomously.
-  //
-  //  (B) TIME-TO-COLLISION τ  (observer / optical flow)
-  //      When the camera is moving toward an object, the object appears to
-  //      grow.  τ = W / (ΔW/Δt) gives an independent distance proxy:
-  //      D_ttc ≈ τ × v_camera  (we use relative frame-to-frame scaling).
-  //      Even without knowing v_camera, the sign & magnitude give us
-  //      a consistency check and feeds back into the adaptive model.
-  // ═══════════════════════════════════════════════════════════════════════════
-
-  /// Returns the best autonomous distance estimate in metres for a blob
-  /// with pixel bounding box [minX, maxX, minY, maxY] in [img].
   double _estimateDistance(
     CameraImage img,
     double minX,
@@ -486,37 +408,25 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     final pixW = (maxX - minX).clamp(1.0, img.width.toDouble());
     final pixH = (maxY - minY).clamp(1.0, img.height.toDouble());
 
-    // ── (A) Adaptive apparent-size model ─────────────────────────────────
-    // focalSizeProduct = focalPx × W_real (learned autonomously)
     final dApparent =
         (_sizeModel.focalSizeProduct / pixW).clamp(0.15, 14.0);
 
-    // ── (B) Temporal scaling / optical flow ──────────────────────────────
-    // Build a stable key from the blob's normalised grid centre
     final blobKey =
         '${((minX + maxX) / 2 / img.width * 8).round()}_${((minY + maxY) / 2 / img.height * 8).round()}';
     double? dTTC;
     if (_prevBlobWidths.containsKey(blobKey)) {
       final prevW = _prevBlobWidths[blobKey]!;
       final deltaW = (pixW - prevW).abs();
-      final growth = pixW - prevW; // positive when object grows
-      // Be more sensitive: allow smaller growths and only feed model when
-      // the object is actually increasing in pixel size (approaching).
+      final growth = pixW - prevW; 
       if (deltaW > 0.2 && growth > 0.0) {
-        final tau = prevW / growth; // frames of time-to-contact
-        // Use a slightly larger proxy velocity to avoid underestimation.
+        final tau = prevW / growth;
+        
         dTTC = (tau * 0.033 * 1.2).clamp(0.12, 14.0);
 
-        // Feed this TTC-derived distance back into the adaptive model
-        // but limit noisy updates by only updating when growth is significant.
         _sizeModel.update(pixW, dTTC);
       }
     }
     _prevBlobWidths[blobKey] = pixW;
-
-    // ── Fuse (A) and (B) ─────────────────────────────────────────────────
-    // If we have a TTC measurement, weight it 40% if the model is immature
-    // (n < 10) and 20% once it has converged.
     double dist;
     if (dTTC != null) {
       final ttcWeight = _sizeModel.sampleCount < 10 ? 0.50 : 0.18;
@@ -525,10 +435,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       dist = dApparent;
     }
 
-    // ── Vertical-position prior (perspective heuristic) ──────────────────
-    // Objects lower in the image (higher yFrac) are generally closer.
-    // We blend in a gentle perspective correction: objects at the bottom
-    // 20% of the frame are scaled DOWN by up to 30%.
     final yFrac = ((minY + maxY) / 2) / img.height;
     if (yFrac > 0.6) {
       final perspScale = 1.0 - 0.30 * ((yFrac - 0.6) / 0.4).clamp(0.0, 1.0);
@@ -537,10 +443,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
 
     return dist.clamp(0.15, 14.0);
   }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Motion-based blob detection  (Any Object mode)
-  // ═══════════════════════════════════════════════════════════════════════════
 
   List<ObjectDetection> _detectMotionBlobs(CameraImage img) {
     final w = img.width;
@@ -579,9 +481,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     return _blobsFromGrid(img, active, cols, rows, gridSz, minCluster: 4);
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Colour-based blob detection  (Target Color mode)
-  // ═══════════════════════════════════════════════════════════════════════════
 
   List<ObjectDetection> _detectColorBlobs(CameraImage img) {
     final w = img.width;
@@ -633,9 +532,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     return _blobsFromGrid(img, active, cols, rows, gridSz, minCluster: 3);
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  BFS blob extraction (shared by both detectors)
-  // ═══════════════════════════════════════════════════════════════════════════
 
   List<ObjectDetection> _blobsFromGrid(
     CameraImage img,
@@ -702,14 +598,10 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       ));
     }
 
-    // Sort nearest first
     detections.sort((a, b) => a.distance.compareTo(b.distance));
     return detections;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Safety state management
-  // ═══════════════════════════════════════════════════════════════════════════
 
   void _setSafety(SafetyState next) {
     if (_safetyState == next) return;
@@ -746,9 +638,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     _pulseCtrl.reset();
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  Helpers
-  // ═══════════════════════════════════════════════════════════════════════════
 
   Color _distColor(double d) {
     if (d < _dangerM) return const Color(0xFFC23A22);
@@ -782,9 +671,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  UI
-  // ═══════════════════════════════════════════════════════════════════════════
 
   @override
   Widget build(BuildContext context) {
@@ -859,7 +745,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     );
   }
 
-  // ── Header ────────────────────────────────────────────────────────────────
 
   Widget _buildHeader(ThemeData theme) => Row(
         children: [
@@ -908,7 +793,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         ],
       );
 
-  // ── Camera preview with AR overlay ──────────────────────────────────────
 
   Widget _buildCameraPreview(ThemeData theme) {
     final previewSize = _camera?.value.previewSize;
@@ -1138,7 +1022,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     );
   }
 
-  // ── Tracking configuration ────────────────────────────────────────────────
 
   Widget _buildTrackingConfig(ThemeData theme) {
     return Container(
@@ -1298,7 +1181,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         ),
       );
 
-  // ── Bottom status bar ─────────────────────────────────────────────────────
 
   Widget _buildBottomBar(ThemeData theme, String distLabel) => Container(
         padding:
@@ -1346,9 +1228,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  AR Overlay Painter
-// ═══════════════════════════════════════════════════════════════════════════════
 
 class _AROverlayPainter extends CustomPainter {
   final List<ObjectDetection> detections;
@@ -1464,9 +1343,6 @@ class _AROverlayPainter extends CustomPainter {
   bool shouldRepaint(_AROverlayPainter old) => true;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Reusable widgets
-// ═══════════════════════════════════════════════════════════════════════════════
 
 class _InfoCard extends StatelessWidget {
   const _InfoCard({
