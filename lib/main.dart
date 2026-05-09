@@ -1,3 +1,6 @@
+import 'dart:typed_data';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
@@ -45,10 +48,79 @@ class ObjectDetection {
     required this.maxX,
     required this.minY,
     required this.maxY,
-  }) : width = (maxX - minX).abs();
+    required this.distance,
+    required this.color,
+  })  : width = (maxX - minX).abs(),
+        height = (maxY - minY).abs();
 
-  double get height => (maxY - minY).abs();
+  Rect get rect => Rect.fromLTRB(minX, minY, maxX, maxY);
+  Offset get center => Offset((minX + maxX) / 2, (minY + maxY) / 2);
+  double get area => width * height;
+
+  double iou(ObjectDetection other) {
+    final iL = math.max(minX, other.minX);
+    final iT = math.max(minY, other.minY);
+    final iR = math.min(maxX, other.maxX);
+    final iB = math.min(maxY, other.maxY);
+    if (iR <= iL || iB <= iT) return 0.0;
+    final inter = (iR - iL) * (iB - iT);
+    final union = area + other.area - inter;
+    return union > 0 ? inter / union : 0.0;
+  }
 }
+
+
+class _EWMASmoother {
+  final double alpha; // 0 < alpha <= 1; larger = faster response
+  double? _value;
+
+  _EWMASmoother({this.alpha = 0.25});
+
+  double add(double v) {
+    _value = (_value == null) ? v : _value! * (1 - alpha) + v * alpha;
+    return _value!;
+  }
+
+  void clear() => _value = null;
+  bool get hasValue => _value != null;
+}
+
+
+class _AdaptiveSizeModel {
+  // EWMA-based focal·size product estimator with simple confidence
+  static const double _defaultProduct = 480.0;
+  double _ewma = _defaultProduct; // estimate of focalPx * W_real
+  int _n = 0;
+  final double _alpha;
+
+  _AdaptiveSizeModel({double alpha = 0.22}) : _alpha = alpha;
+
+  void update(double pixelWidth, double distanceM) {
+    if (distanceM <= 0 || pixelWidth <= 0) return;
+    final product = pixelWidth * distanceM;
+    _n = math.min(_n + 1, 1000000);
+    if (_n == 1) {
+      _ewma = product;
+    } else {
+      _ewma = _ewma * (1.0 - _alpha) + product * _alpha;
+    }
+  }
+
+  double get focalSizeProduct => _n < 2 ? _defaultProduct : _ewma;
+
+  int get sampleCount => _n;
+
+  double get confidence => (_n >= 8) ? 1.0 : (_n / 8.0);
+
+  Map<String, dynamic> toJson() => {'ewma': _ewma, 'n': _n};
+
+  void fromJson(Map<String, dynamic> j) {
+    _ewma = (j['ewma'] as num?)?.toDouble() ?? (j['sum'] as num?)?.toDouble() ?? _defaultProduct;
+    _n = (j['n'] as num?)?.toInt() ?? 0;
+  }
+}
+
+//dashboard 
 
 class RearDistanceDashboard extends StatefulWidget {
   const RearDistanceDashboard({super.key});
@@ -59,15 +131,33 @@ class RearDistanceDashboard extends StatefulWidget {
 
 class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-  static const double _warningThresholdM = 1.5;
-  static const double _dangerThresholdM = 0.8;
-  static const double _knownObjectWidthM = 0.5;
-  static const double _calibratedFocalLength = 0.62;
+  
+  // threshold 
+  static const double _warnM = 1.8;
+  static const double _dangerM = 0.7;
 
-  CameraController? _cameraController;
-  bool _isCameraReady = false;
-  bool _isProcessingFrame = false;
-  bool _supportsFrameProcessing = false;
+  static const double _focalFraction = 0.80;
+  double _focalPx = 1024.0; // updated on first frame
+  bool _focalBootstrapped = false;
+
+  final _AdaptiveSizeModel _sizeModel = _AdaptiveSizeModel();
+
+  Uint8List? _prevLuma;
+  // Per-blob previous pixel-width for τ = size / Δsize computation
+  final Map<String, double> _prevBlobWidths = {};
+
+  ObjectDetection? _lockedDetection;
+  int _missingFrames = 0;
+  static const int _maxMissing = 8;
+  static const double _iouThresh = 0.15;
+  static const double _centreThresh = 0.30;
+// camera control 
+  CameraController? _camera;
+  bool _cameraReady = false;
+  bool _streaming = false;
+  bool _processingFrame = false;
+
+//ui
   double? _distanceM;
   bool _brakeApplied = false;
   SafetyState _safetyState = SafetyState.unknown;
@@ -78,7 +168,17 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
   double _colorTolerance = 75;
   List<ObjectDetection> _detections = [];
 
-  late final AnimationController _dangerPulseController;
+  final _EWMASmoother _smoother = _EWMASmoother(alpha: 0.30);
+
+  late final AnimationController _pulseCtrl;
+
+  static const List<Map<String, dynamic>> _guideLines = [
+    {'label': '0.5m', 'color': Color(0xFFC23A22), 'yFrac': 0.85},
+    {'label': '1.0m', 'color': Color(0xFFD47D00), 'yFrac': 0.65},
+    {'label': '1.5m', 'color': Color(0xFF1D8A4A), 'yFrac': 0.45},
+  ];
+
+  static const String _prefKey = 'adaptiveSizeModel_v2';
 
   @override
   void initState() {
@@ -195,50 +295,98 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     if (_processingFrame) return;
     _processingFrame = true;
     try {
-      final detections = _trackingMode == TrackingMode.anyObject
-          ? _detectAnyObject(image)
-          : _detectTargetColorObject(image);
+      // ── Bootstrap focal length from first frame ──────────────────────────
+      if (!_focalBootstrapped) {
+        _focalPx = img.width * _focalFraction;
+        _focalBootstrapped = true;
+      }
 
-      if (!mounted) {
-        _isProcessingFrame = false;
+      final candidates = _trackingMode == TrackingMode.anyObject
+          ? _detectMotionBlobs(img)
+          : _detectColorBlobs(img);
+
+      if (!mounted) return;
+
+      if (candidates.isEmpty) {
+        _missingFrames++;
+        if (_missingFrames >= _maxMissing) {
+          _lockedDetection = null;
+          _missingFrames = 0;
+          _smoother.clear();
+          setState(() {
+            _distanceM = null;
+            _detections = [];
+            _collisionStatus = 'Scanning…';
+            _brakeApplied = false;
+          });
+          _setSafety(SafetyState.unknown);
+        }
         return;
       }
 
-      if (detections.isEmpty) {
-        setState(() {
-          _distanceM = null;
-          _collisionStatus = 'No target';
-          _detections = [];
-        });
-        _updateSafetyState(SafetyState.unknown);
-        return;
+      ObjectDetection? matched;
+      if (_lockedDetection == null) {
+        // Pick the NEAREST (smallest distance) candidate — the immediate threat
+        matched = candidates.reduce(
+            (a, b) => a.distance <= b.distance ? a : b);
+      } else {
+        double bestScore = -1.0;
+        for (final c in candidates) {
+          final iou = _lockedDetection!.iou(c);
+          final dx =
+              (c.center.dx - _lockedDetection!.center.dx) / img.width;
+          final dy =
+              (c.center.dy - _lockedDetection!.center.dy) / img.width;
+          final score = iou + (1.0 - (dx * dx + dy * dy).clamp(0.0, 1.0));
+          if (score > bestScore) {
+            bestScore = score;
+            matched = c;
+          }
+        }
+        final iouOk = _lockedDetection!.iou(matched!) >= _iouThresh;
+        final dx =
+            (matched.center.dx - _lockedDetection!.center.dx) / img.width;
+        final dy =
+            (matched.center.dy - _lockedDetection!.center.dy) / img.width;
+        final centreOk =
+            (dx * dx + dy * dy) <= _centreThresh * _centreThresh;
+
+        if (!iouOk && !centreOk) {
+          _missingFrames++;
+          if (_missingFrames >= _maxMissing) {
+            _lockedDetection =
+                candidates.reduce((a, b) => a.distance <= b.distance ? a : b);
+            _missingFrames = 0;
+            _smoother.clear();
+          }
+          return;
+        }
       }
 
+      _lockedDetection = matched;
+      _missingFrames = 0;
+
+      final smooth = _smoother.add(matched!.distance);
+      final display = ObjectDetection(
+        minX: matched.minX,
+        maxX: matched.maxX,
+        minY: matched.minY,
+        maxY: matched.maxY,
+        distance: smooth,
+        color: _distColor(smooth),
+      );
+
       setState(() {
-        _detections = detections;
+        _detections = [display];
+        _distanceM = smooth;
+        _collisionStatus = 'Tracking Object';
+        _brakeApplied = smooth < 0.5;
       });
 
-      // Calculate distances for all detections
-      final distances = detections.map((detection) {
-        final objectWidthRatio = detection.width / image.width;
-        return (_knownObjectWidthM * _calibratedFocalLength) / objectWidthRatio;
-      }).toList();
-
-      // Find nearest object
-      final nearestDistance = distances.reduce((a, b) => a < b ? a : b);
-      final clampedDistance = nearestDistance.clamp(0.2, 10.0);
-
-      setState(() {
-        _distanceM = clampedDistance;
-        _collisionStatus = _trackingMode == TrackingMode.anyObject
-            ? 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}'
-            : 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}';
-      });
-
-      if (clampedDistance < _dangerThresholdM) {
-        _updateSafetyState(SafetyState.danger);
-      } else if (clampedDistance < _warningThresholdM) {
-        _updateSafetyState(SafetyState.warning);
+      if (smooth < _dangerM) {
+        _setSafety(SafetyState.danger);
+      } else if (smooth < _warnM) {
+        _setSafety(SafetyState.warning);
       } else {
         _setSafety(SafetyState.safe);
       }
@@ -250,106 +398,87 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     }
   }
 
-  List<ObjectDetection> _detectAnyObject(CameraImage image) {
-    final width = image.width;
-    final height = image.height;
-    final yPlane = image.planes[0].bytes;
-    final yBytesPerRow = image.planes[0].bytesPerRow;
+  double _estimateDistance(
+    CameraImage img,
+    double minX,
+    double maxX,
+    double minY,
+    double maxY,
+  ) {
+    final pixW = (maxX - minX).clamp(1.0, img.width.toDouble());
+    final pixH = (maxY - minY).clamp(1.0, img.height.toDouble());
 
-    final previous = _previousLuma;
-    if (previous == null || previous.length != yPlane.length) {
-      _previousLuma = Uint8List.fromList(yPlane);
+    final dApparent =
+        (_sizeModel.focalSizeProduct / pixW).clamp(0.15, 14.0);
+
+    final blobKey =
+        '${((minX + maxX) / 2 / img.width * 8).round()}_${((minY + maxY) / 2 / img.height * 8).round()}';
+    double? dTTC;
+    if (_prevBlobWidths.containsKey(blobKey)) {
+      final prevW = _prevBlobWidths[blobKey]!;
+      final deltaW = (pixW - prevW).abs();
+      final growth = pixW - prevW; 
+      if (deltaW > 0.2 && growth > 0.0) {
+        final tau = prevW / growth;
+        
+        dTTC = (tau * 0.033 * 1.2).clamp(0.12, 14.0);
+
+        _sizeModel.update(pixW, dTTC);
+      }
+    }
+    _prevBlobWidths[blobKey] = pixW;
+    double dist;
+    if (dTTC != null) {
+      final ttcWeight = _sizeModel.sampleCount < 10 ? 0.50 : 0.18;
+      dist = dTTC * ttcWeight + dApparent * (1.0 - ttcWeight);
+    } else {
+      dist = dApparent;
+    }
+
+    final yFrac = ((minY + maxY) / 2) / img.height;
+    if (yFrac > 0.6) {
+      final perspScale = 1.0 - 0.30 * ((yFrac - 0.6) / 0.4).clamp(0.0, 1.0);
+      dist *= perspScale;
+    }
+
+    return dist.clamp(0.15, 14.0);
+  }
+
+  List<ObjectDetection> _detectMotionBlobs(CameraImage img) {
+    final w = img.width;
+    final h = img.height;
+    final yPlane = img.planes[0].bytes;
+    final bpr = img.planes[0].bytesPerRow;
+
+    // Keep previous luma for frame differencing
+    final prev = _prevLuma;
+    if (prev == null || prev.length != yPlane.length) {
+      _prevLuma = Uint8List.fromList(yPlane);
       return [];
     }
 
-    // Motion detection
-    int minX = width;
-    int maxX = 0;
-    int minY = height;
-    int maxY = 0;
-    int motionPixels = 0;
+    const int gridSz = 10;
+    final cols = w ~/ gridSz;
+    final rows = h ~/ gridSz;
+    final active = List.filled(cols * rows, false);
+    bool anyMotion = false;
 
-    const int motionThreshold = 20;
-
-    for (int y = 0; y < height; y += 4) {
-      for (int x = 0; x < width; x += 4) {
-        final index = y * yBytesPerRow + x;
-        if (index < yPlane.length && index < previous.length) {
-          final diff = (yPlane[index] - previous[index]).abs();
-          if (diff > motionThreshold) {
-            motionPixels++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
+    // Stride-8 luma differencing
+    for (int y = 0; y < h; y += 8) {
+      for (int x = 0; x < w; x += 8) {
+        final idx = y * bpr + x;
+        if (idx >= yPlane.length || idx >= prev.length) continue;
+        if ((yPlane[idx] - prev[idx]).abs() > 12) {
+          active[(y ~/ gridSz) * cols + (x ~/ gridSz)] = true;
+          anyMotion = true;
         }
       }
     }
 
-    _previousLuma = Uint8List.fromList(yPlane);
+    _prevLuma = Uint8List.fromList(yPlane);
+    if (!anyMotion) return [];
 
-    // If motion detected
-    if (motionPixels > 20 && maxX > minX && maxY > minY) {
-      return [ObjectDetection(
-        minX: minX.toDouble(),
-        maxX: maxX.toDouble(),
-        minY: minY.toDouble(),
-        maxY: maxY.toDouble(),
-      )];
-    }
-
-    // Strong edge detection for static objects using Sobel-like approach
-    minX = width;
-    maxX = 0;
-    minY = height;
-    maxY = 0;
-    int edgePixels = 0;
-
-    const int step = 3;
-    const int strongEdgeThreshold = 40;
-
-    for (int y = step; y < height - step; y += step) {
-      for (int x = step; x < width - step; x += step) {
-        final idx = y * yBytesPerRow + x;
-        if (idx + step < yPlane.length) {
-          final center = yPlane[idx];
-          
-          // Sobel-like gradients
-          final gx = (yPlane[idx + step] - yPlane[idx - step]).abs();
-          final gy = (yPlane[idx + (step * yBytesPerRow)] - yPlane[idx - (step * yBytesPerRow)]).abs();
-          
-          final edgeStrength = (gx + gy) ~/ 2;
-          
-          // Only detect strong edges
-          if (edgeStrength > strongEdgeThreshold) {
-            edgePixels++;
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-          }
-        }
-      }
-    }
-
-    // Require significant edge regions
-    if (edgePixels > 40 && maxX > minX && maxY > minY) {
-      final widthPx = maxX - minX;
-      final heightPx = maxY - minY;
-      
-      // Filter out very thin or elongated detections (likely noise)
-      if (widthPx > 20 && heightPx > 20) {
-        return [ObjectDetection(
-          minX: minX.toDouble(),
-          maxX: maxX.toDouble(),
-          minY: minY.toDouble(),
-          maxY: maxY.toDouble(),
-        )];
-      }
-    }
-
-    return [];
+    return _blobsFromGrid(img, active, cols, rows, gridSz, minCluster: 4);
   }
 
 
@@ -365,20 +494,21 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     final vBpr = img.planes[2].bytesPerRow;
     final vBpp = img.planes[2].bytesPerPixel ?? 1;
 
-    int minX = width;
-    int maxX = 0;
-    int minY = height;
-    int maxY = 0;
-    int targetPixels = 0;
+    const int gridSz = 10;
+    final cols = w ~/ gridSz;
+    final rows = h ~/ gridSz;
+    final active = List.filled(cols * rows, false);
 
     final tR = ((_targetColor.value >> 16) & 0xFF).toDouble();
     final tG = ((_targetColor.value >> 8) & 0xFF).toDouble();
     final tB = (_targetColor.value & 0xFF).toDouble();
     final maxDsq = _colorTolerance * _colorTolerance;
 
-    for (int y = 0; y < height; y += 4) {
-      for (int x = 0; x < width; x += 4) {
-        final yIndex = y * yBytesPerRow + x;
+    for (int gy = 0; gy < rows; gy++) {
+      for (int gx = 0; gx < cols; gx++) {
+        final x = gx * gridSz + gridSz ~/ 2;
+        final y = gy * gridSz + gridSz ~/ 2;
+        final yIdx = y * yBpr + x;
         final uvRow = y ~/ 2;
         final uvCol = x ~/ 2;
         final uIdx = uvRow * uBpr + uvCol * uBpp;
@@ -386,52 +516,90 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         if (yIdx >= yP.length || uIdx >= uP.length || vIdx >= vP.length) {
           continue;
         }
-
-        final yValue = yPlane[yIndex].toDouble();
-        final uValue = uPlane[uIndex].toDouble() - 128.0;
-        final vValue = vPlane[vIndex].toDouble() - 128.0;
-
-        final r = (yValue + 1.402 * vValue).clamp(0, 255).toInt();
-        final g = (yValue - 0.344136 * uValue - 0.714136 * vValue)
-            .clamp(0, 255)
-            .toInt();
-        final b = (yValue + 1.772 * uValue).clamp(0, 255).toInt();
-
-        final dr = (r - targetR).toDouble();
-        final dg = (g - targetG).toDouble();
-        final db = (b - targetB).toDouble();
-        final colorDistanceSquared = (dr * dr) + (dg * dg) + (db * db);
-
-        if (colorDistanceSquared <= maxDistanceSquared) {
-          targetPixels++;
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-        }
+        final yv = yP[yIdx].toDouble();
+        final uv = uP[uIdx].toDouble() - 128.0;
+        final vv = vP[vIdx].toDouble() - 128.0;
+        final r = (yv + 1.402 * vv).clamp(0.0, 255.0);
+        final g = (yv - 0.344136 * uv - 0.714136 * vv).clamp(0.0, 255.0);
+        final b = (yv + 1.772 * uv).clamp(0.0, 255.0);
+        final dsq = (r - tR) * (r - tR) +
+            (g - tG) * (g - tG) +
+            (b - tB) * (b - tB);
+        if (dsq < maxDsq) active[gy * cols + gx] = true;
       }
     }
 
-    if (targetPixels > 15 && maxX > minX && maxY > minY) {
-      return [ObjectDetection(
-        minX: minX.toDouble(),
-        maxX: maxX.toDouble(),
-        minY: minY.toDouble(),
-        maxY: maxY.toDouble(),
-      )];
-    }
-
-    return [];
+    return _blobsFromGrid(img, active, cols, rows, gridSz, minCluster: 3);
   }
 
-  List<ObjectDetection> _clusterObjects(
-    List<bool> pixelMap,
-    int width,
-    int height,
-    int minPixels,
-  ) {
-    // This function is no longer used but kept for compatibility
-    return [];
+
+  List<ObjectDetection> _blobsFromGrid(
+    CameraImage img,
+    List<bool> active,
+    int cols,
+    int rows,
+    int gridSz, {
+    int minCluster = 4,
+  }) {
+    final visited = List.filled(active.length, false);
+    final detections = <ObjectDetection>[];
+
+    for (int i = 0; i < active.length; i++) {
+      if (!active[i] || visited[i]) continue;
+
+      int minGX = i % cols, maxGX = i % cols;
+      int minGY = i ~/ cols, maxGY = i ~/ cols;
+      final queue = <int>[i];
+      visited[i] = true;
+      int count = 0;
+
+      while (queue.isNotEmpty && count < 80) {
+        final cur = queue.removeAt(0);
+        count++;
+        final cx = cur % cols, cy = cur ~/ cols;
+        if (cx < minGX) minGX = cx;
+        if (cx > maxGX) maxGX = cx;
+        if (cy < minGY) minGY = cy;
+        if (cy > maxGY) maxGY = cy;
+
+        for (int dy = -1; dy <= 1; dy++) {
+          for (int dx = -1; dx <= 1; dx++) {
+            final nx = cx + dx, ny = cy + dy;
+            if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+            final ni = ny * cols + nx;
+            if (active[ni] && !visited[ni]) {
+              visited[ni] = true;
+              queue.add(ni);
+            }
+          }
+        }
+      }
+
+      if (count < minCluster) continue;
+
+      final bMinX = minGX * gridSz.toDouble();
+      final bMaxX = (maxGX + 1) * gridSz.toDouble();
+      final bMinY = minGY * gridSz.toDouble();
+      final bMaxY = (maxGY + 1) * gridSz.toDouble();
+
+      // Reject micro-noise blobs
+      if ((bMaxX - bMinX) * (bMaxY - bMinY) <
+          img.width * img.height * 0.0004) continue;
+
+      final dist = _estimateDistance(img, bMinX, bMaxX, bMinY, bMaxY);
+
+      detections.add(ObjectDetection(
+        minX: bMinX,
+        maxX: bMaxX,
+        minY: bMinY,
+        maxY: bMaxY,
+        distance: dist,
+        color: _distColor(dist),
+      ));
+    }
+
+    detections.sort((a, b) => a.distance.compareTo(b.distance));
+    return detections;
   }
 
 
@@ -799,346 +967,261 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                     color: _stateColor,
                     letterSpacing: -1,
                   ),
-                  const SizedBox(height: 10),
-                  if (!_supportsFrameProcessing)
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFFFF3CD),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(
-                            Icons.info_rounded,
-                            color: Color(0xFF856404),
-                            size: 20,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              'Distance detection requires a device that supports frame streaming (phones/tablets).',
-                              style: theme.textTheme.bodySmall?.copyWith(
-                                color: const Color(0xFF856404),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  else ...[
-                    SegmentedButton<TrackingMode>(
-                      segments: const [
-                        ButtonSegment(
-                          value: TrackingMode.anyObject,
-                          label: Text('Any Object'),
-                          icon: Icon(Icons.visibility_rounded),
-                        ),
-                        ButtonSegment(
-                          value: TrackingMode.targetColor,
-                          label: Text('Target Color'),
-                          icon: Icon(Icons.palette_rounded),
-                        ),
-                      ],
-                      selected: {_trackingMode},
-                      onSelectionChanged: (selection) {
-                        final selectedMode = selection.first;
-                        setState(() {
-                          _trackingMode = selectedMode;
-                          _distanceM = null;
-                          _collisionStatus = 'Mode switched';
-                          _previousLuma = null;
-                          _detections = [];
-                        });
-                      },
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      _trackingMode == TrackingMode.anyObject
-                          ? 'Tracks moving objects in rear camera view.'
-                          : 'Tracks objects close to selected color.',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: const Color(0xFF607086),
-                      ),
-                    ),
-                  ],
-                  if (_trackingMode == TrackingMode.targetColor && _supportsFrameProcessing) ...[
-                    const SizedBox(height: 14),
-                    Row(
-                      children: [
-                        Container(
-                          width: 24,
-                          height: 24,
-                          decoration: BoxDecoration(
-                            color: _targetColor,
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(
-                              color: const Color(0xFFCBD5E1),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 10),
-                        Text(
-                          'Selected Color',
-                          style: theme.textTheme.bodyMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    _ColorChannelSlider(
-                      label: 'Red',
-                      value: _targetColor.red.toDouble(),
-                      activeColor: Colors.red,
-                      onChanged: (value) {
-                        setState(() {
-                          _targetColor = _targetColor.withRed(value.toInt());
-                        });
-                      },
-                    ),
-                    _ColorChannelSlider(
-                      label: 'Green',
-                      value: _targetColor.green.toDouble(),
-                      activeColor: Colors.green,
-                      onChanged: (value) {
-                        setState(() {
-                          _targetColor = _targetColor.withGreen(value.toInt());
-                        });
-                      },
-                    ),
-                    _ColorChannelSlider(
-                      label: 'Blue',
-                      value: _targetColor.blue.toDouble(),
-                      activeColor: Colors.blue,
-                      onChanged: (value) {
-                        setState(() {
-                          _targetColor = _targetColor.withBlue(value.toInt());
-                        });
-                      },
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Tolerance: ${_colorTolerance.toStringAsFixed(0)}',
-                      style: theme.textTheme.bodySmall,
-                    ),
-                    Slider(
-                      value: _colorTolerance,
-                      min: 20,
-                      max: 140,
-                      onChanged: (value) {
-                        setState(() {
-                          _colorTolerance = value;
-                        });
-                      },
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [stateColor.withValues(alpha: 0.9), stateColor],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                borderRadius: BorderRadius.circular(24),
-                boxShadow: [
-                  BoxShadow(
-                    color: stateColor.withValues(alpha: 0.22),
-                    blurRadius: 18,
-                    offset: const Offset(0, 10),
-                  ),
-                ],
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        'Current Rear Distance',
-                        style: theme.textTheme.bodyLarge?.copyWith(
-                          color: Colors.white.withValues(alpha: 0.92),
-                          fontWeight: FontWeight.w500,
-                        ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(999),
-                        ),
-                        child: Text(
-                          '$stateLabel • ${_trackingModeLabel()}',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w600,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 14),
-                  Text(
-                    distanceLabel,
-                    style: theme.textTheme.displayMedium?.copyWith(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 1.2,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    !_supportsFrameProcessing
-                        ? 'Frame processing not available on this platform'
-                        : _distanceM == null
-                            ? 'Searching for tracked object'
-                            : 'Estimated from object size in frame',
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: Colors.white.withValues(alpha: 0.85),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            Row(
-              children: [
-                Expanded(
-                  child: _InfoCard(
-                    icon: Icons.warning_amber_rounded,
-                    title: 'Alert Zone',
-                    value: '< ${_dangerThresholdM.toStringAsFixed(1)} m',
-                    color: badgeColor,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _InfoCard(
-                    icon: Icons.speed_rounded,
-                    title: 'Brake Hint',
-                    value: _safetyState == SafetyState.danger
-                        ? 'Brake Now'
-                        : _safetyState == SafetyState.warning
-                            ? 'Slow Down'
-                            : 'Standby',
-                    color: _safetyState == SafetyState.danger
-                        ? const Color(0xFFC23A22)
-                        : _safetyState == SafetyState.warning
-                            ? const Color(0xFFD47D00)
-                            : const Color(0xFF1D8A4A),
-                  ),
                 ),
               ],
             ),
-            if (isDanger) ...[
-              const SizedBox(height: 16),
-              Center(
-                child: AnimatedBuilder(
-                  animation: _dangerPulseController,
-                  builder: (context, child) {
-                    final t = _dangerPulseController.value;
-                    return Container(
-                      width: 78 + (16 * t),
-                      height: 78 + (16 * t),
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: const Color(0xFFC23A22)
-                            .withValues(alpha: 0.12 + (0.12 * (1 - t))),
-                      ),
-                      child: Center(
-                        child: Container(
-                          width: 64,
-                          height: 64,
-                          decoration: const BoxDecoration(
-                            color: Color(0xFFC23A22),
-                            shape: BoxShape.circle,
-                          ),
-                          child: const Icon(
-                            Icons.priority_high_rounded,
-                            color: Colors.white,
-                            size: 34,
-                          ),
-                        ),
-                      ),
-                    );
-                  },
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: _stateColor.withValues(alpha: 0.20),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Text(
+                  _stateLabel,
+                  style: theme.textTheme.labelLarge
+                      ?.copyWith(color: _stateColor, fontWeight: FontWeight.w800),
                 ),
               ),
+              const SizedBox(height: 8),
+              // Brake pill
+              if (_brakeApplied)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFC23A22),
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFFC23A22).withOpacity(0.25),
+                        blurRadius: 8,
+                        offset: const Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.car_repair, color: Colors.white, size: 14),
+                      const SizedBox(width: 6),
+                      Text('Brake Applied',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                              color: Colors.white, fontWeight: FontWeight.w900)),
+                    ],
+                  ),
+                ),
             ],
-            const SizedBox(height: 20),
-            Container(
-              padding: const EdgeInsets.all(18),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Rear View Status',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
+          ),
+        ],
+      ),
+    );
+  }
+
+
+  Widget _buildTrackingConfig(ThemeData theme) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E293B),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Tracking Mode',
+              style: theme.textTheme.titleMedium
+                  ?.copyWith(fontWeight: FontWeight.w700, color: Colors.white)),
+          const SizedBox(height: 12),
+          if (!_streaming)
+            _warningBanner(
+                'Distance detection requires a device supporting camera frame streaming.')
+          else ...[
+            SegmentedButton<TrackingMode>(
+              segments: const [
+                ButtonSegment(
+                    value: TrackingMode.anyObject,
+                    label: Text('Any Object'),
+                    icon: Icon(Icons.visibility_rounded)),
+                ButtonSegment(
+                    value: TrackingMode.targetColor,
+                    label: Text('Target Color'),
+                    icon: Icon(Icons.palette_rounded)),
+              ],
+              selected: {_trackingMode},
+              onSelectionChanged: (s) => setState(() {
+                _trackingMode = s.first;
+                _resetTracking();
+              }),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              _trackingMode == TrackingMode.anyObject
+                  ? 'Locks onto the nearest moving obstacle detected.'
+                  : 'Locks onto the nearest object matching the target color.',
+              style: theme.textTheme.bodyMedium
+                  ?.copyWith(color: const Color(0xFF607086)),
+            ),
+          ],
+          if (_trackingMode == TrackingMode.targetColor && _streaming) ...[
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: _targetColor,
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: const Color(0xFFCBD5E1)),
                   ),
-                  const SizedBox(height: 12),
-                  _StatusRow(
-                    label: 'Sensor Connection',
-                    status: _sensorStatus,
-                    color: _isCameraReady
-                        ? const Color(0xFF1D8A4A)
-                        : const Color(0xFFC23A22),
+                ),
+                const SizedBox(width: 10),
+                Text('Target Color', style: theme.textTheme.bodyMedium),
+              ],
+            ),
+            const SizedBox(height: 8),
+            _ColorChannelSlider(
+                label: 'Red',
+                value: _targetColor.red.toDouble(),
+                activeColor: Colors.red,
+                onChanged: (v) => setState(
+                    () => _targetColor = _targetColor.withRed(v.toInt()))),
+            _ColorChannelSlider(
+                label: 'Green',
+                value: _targetColor.green.toDouble(),
+                activeColor: Colors.green,
+                onChanged: (v) => setState(
+                    () => _targetColor = _targetColor.withGreen(v.toInt()))),
+            _ColorChannelSlider(
+                label: 'Blue',
+                value: _targetColor.blue.toDouble(),
+                activeColor: Colors.blue,
+                onChanged: (v) => setState(
+                    () => _targetColor = _targetColor.withBlue(v.toInt()))),
+            const SizedBox(height: 4),
+            Text('Tolerance: ${_colorTolerance.toStringAsFixed(0)}',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: const Color(0xFF94A3B8))),
+            Slider(
+                value: _colorTolerance,
+                min: 20,
+                max: 140,
+                onChanged: (v) => setState(() => _colorTolerance = v)),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _warningBanner(String text) => Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+            color: const Color(0xFFFFF3CD),
+            borderRadius: BorderRadius.circular(8)),
+        child: Row(
+          children: [
+            const Icon(Icons.info_rounded,
+                color: Color(0xFF856404), size: 18),
+            const SizedBox(width: 8),
+            Expanded(
+                child: Text(text,
+                    style: const TextStyle(
+                        color: Color(0xFF856404), fontSize: 12))),
+          ],
+        ),
+      );
+
+  // ── Sensor info panel ─────────────────────────────────────────────────────
+
+  Widget _buildSensorInfo(ThemeData theme) => Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0B1220),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.04)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Sensor Information',
+                style: theme.textTheme.titleSmall?.copyWith(
+                    color: Colors.white, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 10),
+            _StatusRow(
+                label: 'Camera',
+                status: _sensorStatus,
+                color: _cameraReady
+                    ? const Color(0xFF1D8A4A)
+                    : const Color(0xFFC23A22)),
+            const SizedBox(height: 6),
+            _StatusRow(
+                label: 'Depth Engine',
+                status: 'Optical-Flow + Adaptive Size Model',
+                color: const Color(0xFF0E6BA8)),
+            const SizedBox(height: 6),
+            _StatusRow(
+                label: 'Focal Length',
+                status:
+                    '${_focalPx.toStringAsFixed(0)} px (auto)',
+                color: const Color(0xFF1D8A4A)),
+            const SizedBox(height: 6),
+            _StatusRow(
+              label: 'Model Samples',
+              status: '${_sizeModel.sampleCount}',
+              color: _sizeModel.sampleCount < 5
+                ? const Color(0xFFD47D00)
+                : const Color(0xFF1D8A4A)),
+          ],
+        ),
+      );
+
+
+  Widget _buildBottomBar(ThemeData theme, String distLabel) => Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              _stateColor.withValues(alpha: 0.85),
+              _stateColor.withValues(alpha: 0.70),
+            ],
+          ),
+          borderRadius: BorderRadius.circular(20),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text('Nearest Obstacle',
+                style: theme.textTheme.titleMedium?.copyWith(
+                    color: Colors.white, fontWeight: FontWeight.w700)),
+            Row(
+              children: [
+                Text(_stateLabel,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600)),
+                const SizedBox(width: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.20),
+                    borderRadius: BorderRadius.circular(8),
                   ),
-                  const SizedBox(height: 8),
-                  _StatusRow(
-                    label: 'Collision Prediction',
-                    status: !_supportsFrameProcessing
-                        ? 'Unavailable'
-                        : _collisionStatus,
-                    color: !_supportsFrameProcessing
-                        ? const Color(0xFFC23A22)
-                        : _safetyState == SafetyState.danger
-                            ? const Color(0xFFC23A22)
-                            : _safetyState == SafetyState.warning
-                                ? const Color(0xFFD47D00)
-                                : const Color(0xFF607086),
-                  ),
-                  const SizedBox(height: 8),
-                  _StatusRow(
-                    label: 'Frame Processing',
-                    status: _supportsFrameProcessing ? 'Active' : 'Not supported',
-                    color: _supportsFrameProcessing
-                        ? const Color(0xFF1D8A4A)
-                        : const Color(0xFFC23A22),
-                  ),
-                  const SizedBox(height: 8),
-                  _StatusRow(
-                    label: 'Tracking Mode',
-                    status: _trackingModeLabel(),
-                    color: const Color(0xFF0E6BA8),
-                  ),
-                  const SizedBox(height: 8),
-                  _StatusRow(
-                    label: 'Audio Warning',
-                    status: _safetyState == SafetyState.danger
-                        ? 'Triggered'
-                        : _safetyState == SafetyState.warning
-                            ? 'Armed'
-                            : 'Ready',
-                    color: _safetyState == SafetyState.danger
-                        ? const Color(0xFFC23A22)
-                        : const Color(0xFF1D8A4A),
-                  ),
-                ],
-              ),
+                  child: Text(distLabel,
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 14)),
+                ),
+              ],
             ),
           ],
         ),
