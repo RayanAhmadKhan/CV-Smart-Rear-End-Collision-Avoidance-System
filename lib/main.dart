@@ -1,46 +1,44 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const RearCollisionMonitorApp());
 }
+
 
 class RearCollisionMonitorApp extends StatelessWidget {
   const RearCollisionMonitorApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF0E6BA8),
-      brightness: Brightness.light,
-    );
-
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Rear Distance Monitor',
+      title: 'Smart Rear Monitor',
       theme: ThemeData(
         useMaterial3: true,
-        colorScheme: scheme,
-        scaffoldBackgroundColor: const Color(0xFFF5F8FC),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF0E6BA8),
+          brightness: Brightness.dark,
+        ),
+        scaffoldBackgroundColor: const Color(0xFF0A0F16),
       ),
       home: const RearDistanceDashboard(),
     );
   }
 }
 
+
 enum SafetyState { safe, warning, danger, unknown }
 
 enum TrackingMode { anyObject, targetColor }
 
 class ObjectDetection {
-  final double minX;
-  final double maxX;
-  final double minY;
-  final double maxY;
-  final double width;
+  final double minX, maxX, minY, maxY;
+  final double width, height;
+  final double distance;
+  final Color color;
 
   ObjectDetection({
     required this.minX,
@@ -50,19 +48,6 @@ class ObjectDetection {
   }) : width = (maxX - minX).abs();
 
   double get height => (maxY - minY).abs();
-  double get area => width * height;
-  Offset get center => Offset((minX + maxX) * 0.5, (minY + maxY) * 0.5);
-
-  double iou(ObjectDetection other) {
-    final left = math.max(minX, other.minX);
-    final top = math.max(minY, other.minY);
-    final right = math.min(maxX, other.maxX);
-    final bottom = math.min(maxY, other.maxY);
-    if (right <= left || bottom <= top) return 0.0;
-    final inter = (right - left) * (bottom - top);
-    final union = area + other.area - inter;
-    return union > 0 ? inter / union : 0.0;
-  }
 }
 
 class RearDistanceDashboard extends StatefulWidget {
@@ -76,143 +61,141 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   static const double _warningThresholdM = 1.5;
   static const double _dangerThresholdM = 0.8;
-  static const int _maxMissedFrames = 7;
-  static const double _lockIouThreshold = 0.25;
-  static const double _lockCenterThreshold = 0.18;
-  static const double _initialProductPxM = 620.0;
+  static const double _knownObjectWidthM = 0.5;
+  static const double _calibratedFocalLength = 0.62;
 
   CameraController? _cameraController;
   bool _isCameraReady = false;
   bool _isProcessingFrame = false;
   bool _supportsFrameProcessing = false;
   double? _distanceM;
+  bool _brakeApplied = false;
   SafetyState _safetyState = SafetyState.unknown;
   TrackingMode _trackingMode = TrackingMode.anyObject;
   String _sensorStatus = 'Starting';
   String _collisionStatus = 'Idle';
   Color _targetColor = const Color(0xFFE53935);
   double _colorTolerance = 75;
-  Uint8List? _previousLuma;
   List<ObjectDetection> _detections = [];
-  ObjectDetection? _lockedDetection;
-  int _missedFrames = 0;
-  double _distanceEwma = 2.5;
-  bool _hasDistanceEwma = false;
-  double _adaptiveProductPxM = _initialProductPxM;
-  int _adaptiveSamples = 0;
-  double? _prevDetectionWidth;
+
+  late final AnimationController _dangerPulseController;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _dangerPulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    );
-    _initializeCamera();
+    _pulseCtrl = AnimationController(
+        vsync: this, duration: const Duration(milliseconds: 900));
+    _loadModel();
+    _initCamera();
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_prefKey);
+      if (raw != null) {
+
+        final ewmaMatch = RegExp(r'"ewma":([\d.eE+\-]+)').firstMatch(raw);
+        final sumMatch = RegExp(r'"sum":([\d.eE+\-]+)').firstMatch(raw);
+        final nMatch = RegExp(r'"n":(\d+)').firstMatch(raw);
+        if ((ewmaMatch != null || sumMatch != null) && nMatch != null) {
+          _sizeModel.fromJson({
+            'ewma': double.tryParse(ewmaMatch?.group(1) ?? sumMatch!.group(1)!) ?? 0.0,
+            'n': int.tryParse(nMatch.group(1)!) ?? 0,
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveModel() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final m = _sizeModel.toJson();
+      await prefs.setString(_prefKey, '{"ewma":${m['ewma']},"n":${m['n']}}');
+    } catch (_) {}
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) {
-      return;
-    }
+    final c = _camera;
+    if (c == null || !c.value.isInitialized) return;
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused) {
-      controller.stopImageStream();
-      controller.dispose();
-      _cameraController = null;
-      _isCameraReady = false;
+      c.stopImageStream();
+      c.dispose();
+      _camera = null;
+      _cameraReady = false;
     } else if (state == AppLifecycleState.resumed) {
-      _initializeCamera();
+      _initCamera();
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _dangerPulseController.dispose();
-    _cameraController?.dispose();
+    _pulseCtrl.dispose();
+    _camera?.dispose();
+    _saveModel();
     super.dispose();
   }
 
-  Future<void> _initializeCamera() async {
+// camera initialization
+  Future<void> _initCamera() async {
     try {
       final cameras = await availableCameras();
       if (cameras.isEmpty) {
-        if (!mounted) return;
-        setState(() {
-          _sensorStatus = 'No camera found';
-          _isCameraReady = false;
-        });
+        _setStatus(sensor: 'No camera found');
         return;
       }
-
-      final rearCamera = cameras.firstWhere(
-        (camera) => camera.lensDirection == CameraLensDirection.back,
-        orElse: () => cameras.firstWhere(
-          (camera) => camera.lensDirection == CameraLensDirection.front,
-          orElse: () => cameras.first,
-        ),
+      final cam = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
       );
-
-      final controller = CameraController(
-        rearCamera,
-        ResolutionPreset.medium,
+      final ctrl = CameraController(
+        cam,
+        ResolutionPreset.medium, // ~1280×720 
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );
-
-      await controller.initialize();
+      await ctrl.initialize();
       if (!mounted) {
-        await controller.dispose();
+        await ctrl.dispose();
         return;
       }
 
-      // Try to start image streaming (not supported on all platforms like Windows web)
-      bool supportsStreaming = false;
+      bool canStream = false;
       try {
-        await controller.startImageStream(_processFrame);
-        supportsStreaming = true;
-      } catch (_) {
-        // Frame streaming not supported on this platform
-        supportsStreaming = false;
-      }
-
-      if (!mounted) {
-        await controller.dispose();
-        return;
-      }
+        await ctrl.startImageStream(_onFrame);
+        canStream = true;
+      } catch (_) {}
 
       setState(() {
-        _cameraController = controller;
-        _supportsFrameProcessing = supportsStreaming;
-        _sensorStatus = supportsStreaming 
-            ? 'Connected' 
-            : 'Connected (preview only)';
-        _isCameraReady = true;
+        _camera = ctrl;
+        _streaming = canStream;
+        _cameraReady = true;
+        _sensorStatus = canStream ? 'Connected' : 'Preview only';
       });
     } catch (e) {
-      if (!mounted) return;
-      // ignore: avoid_print
-      print('Camera initialization error: $e');
-      setState(() {
-        _sensorStatus = 'Error: ${e.toString().split('\n').first}';
-        _isCameraReady = false;
-      });
+      _setStatus(sensor: 'Error: ${e.toString().split('\n').first}');
     }
   }
 
-  void _processFrame(CameraImage image) {
-    if (_isProcessingFrame) {
-      return;
-    }
-    _isProcessingFrame = true;
+  void _setStatus({String? sensor, String? collision}) {
+    if (!mounted) return;
+    setState(() {
+      if (sensor != null) _sensorStatus = sensor;
+      if (collision != null) _collisionStatus = collision;
+    });
+  }
 
+//frame processing and detection
+  void _onFrame(CameraImage img) {
+    if (_processingFrame) return;
+    _processingFrame = true;
     try {
-        final detections = _trackingMode == TrackingMode.anyObject
+      final detections = _trackingMode == TrackingMode.anyObject
           ? _detectAnyObject(image)
           : _detectTargetColorObject(image);
 
@@ -222,12 +205,6 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       }
 
       if (detections.isEmpty) {
-        _missedFrames++;
-        if (_missedFrames >= _maxMissedFrames) {
-          _lockedDetection = null;
-          _prevDetectionWidth = null;
-          _hasDistanceEwma = false;
-        }
         setState(() {
           _distanceM = null;
           _collisionStatus = 'No target';
@@ -237,38 +214,39 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         return;
       }
 
-      _missedFrames = 0;
-
-      final locked = _pickLockedDetection(detections, image);
-      if (locked == null) {
-        setState(() {
-          _distanceM = null;
-          _collisionStatus = 'No stable target';
-          _detections = detections;
-        });
-        _updateSafetyState(SafetyState.unknown);
-        return;
-      }
-
-      _lockedDetection = locked;
-
-      final estimatedDistance = _estimateDistanceFromLocked(locked, image.width);
-
       setState(() {
-        _distanceM = estimatedDistance;
-        _collisionStatus = 'Tracking stable target';
-        _detections = [locked];
+        _detections = detections;
       });
 
-      if (estimatedDistance < _dangerThresholdM) {
+      // Calculate distances for all detections
+      final distances = detections.map((detection) {
+        final objectWidthRatio = detection.width / image.width;
+        return (_knownObjectWidthM * _calibratedFocalLength) / objectWidthRatio;
+      }).toList();
+
+      // Find nearest object
+      final nearestDistance = distances.reduce((a, b) => a < b ? a : b);
+      final clampedDistance = nearestDistance.clamp(0.2, 10.0);
+
+      setState(() {
+        _distanceM = clampedDistance;
+        _collisionStatus = _trackingMode == TrackingMode.anyObject
+            ? 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}'
+            : 'Tracking ${detections.length} object${detections.length > 1 ? 's' : ''}';
+      });
+
+      if (clampedDistance < _dangerThresholdM) {
         _updateSafetyState(SafetyState.danger);
-      } else if (estimatedDistance < _warningThresholdM) {
+      } else if (clampedDistance < _warningThresholdM) {
         _updateSafetyState(SafetyState.warning);
       } else {
-        _updateSafetyState(SafetyState.safe);
+        _setSafety(SafetyState.safe);
       }
+
+      // Persist model periodically (every ~30 frames ≈ 1s)
+      if (_sizeModel.sampleCount % 30 == 0 && _sizeModel.sampleCount > 0) _saveModel();
     } finally {
-      _isProcessingFrame = false;
+      _processingFrame = false;
     }
   }
 
@@ -284,25 +262,26 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
       return [];
     }
 
-    // Grid motion map to separate independent moving regions.
-    const int cellSize = 12;
-    final cols = width ~/ cellSize;
-    final rows = height ~/ cellSize;
-    final active = List<bool>.filled(cols * rows, false);
+    // Motion detection
+    int minX = width;
+    int maxX = 0;
+    int minY = height;
+    int maxY = 0;
+    int motionPixels = 0;
 
-    const int motionThreshold = 14;
+    const int motionThreshold = 20;
 
-    for (int y = 0; y < height; y += 6) {
-      for (int x = 0; x < width; x += 6) {
+    for (int y = 0; y < height; y += 4) {
+      for (int x = 0; x < width; x += 4) {
         final index = y * yBytesPerRow + x;
         if (index < yPlane.length && index < previous.length) {
           final diff = (yPlane[index] - previous[index]).abs();
           if (diff > motionThreshold) {
-            final cx = x ~/ cellSize;
-            final cy = y ~/ cellSize;
-            if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
-              active[cy * cols + cx] = true;
-            }
+            motionPixels++;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
           }
         }
       }
@@ -310,43 +289,101 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
 
     _previousLuma = Uint8List.fromList(yPlane);
 
-    return _clusterObjects(active, cols, rows, minPixels: 4, cellSize: cellSize);
+    // If motion detected
+    if (motionPixels > 20 && maxX > minX && maxY > minY) {
+      return [ObjectDetection(
+        minX: minX.toDouble(),
+        maxX: maxX.toDouble(),
+        minY: minY.toDouble(),
+        maxY: maxY.toDouble(),
+      )];
+    }
+
+    // Strong edge detection for static objects using Sobel-like approach
+    minX = width;
+    maxX = 0;
+    minY = height;
+    maxY = 0;
+    int edgePixels = 0;
+
+    const int step = 3;
+    const int strongEdgeThreshold = 40;
+
+    for (int y = step; y < height - step; y += step) {
+      for (int x = step; x < width - step; x += step) {
+        final idx = y * yBytesPerRow + x;
+        if (idx + step < yPlane.length) {
+          final center = yPlane[idx];
+          
+          // Sobel-like gradients
+          final gx = (yPlane[idx + step] - yPlane[idx - step]).abs();
+          final gy = (yPlane[idx + (step * yBytesPerRow)] - yPlane[idx - (step * yBytesPerRow)]).abs();
+          
+          final edgeStrength = (gx + gy) ~/ 2;
+          
+          // Only detect strong edges
+          if (edgeStrength > strongEdgeThreshold) {
+            edgePixels++;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+    }
+
+    // Require significant edge regions
+    if (edgePixels > 40 && maxX > minX && maxY > minY) {
+      final widthPx = maxX - minX;
+      final heightPx = maxY - minY;
+      
+      // Filter out very thin or elongated detections (likely noise)
+      if (widthPx > 20 && heightPx > 20) {
+        return [ObjectDetection(
+          minX: minX.toDouble(),
+          maxX: maxX.toDouble(),
+          minY: minY.toDouble(),
+          maxY: maxY.toDouble(),
+        )];
+      }
+    }
+
+    return [];
   }
 
-  List<ObjectDetection> _detectTargetColorObject(CameraImage image) {
-    final width = image.width;
-    final height = image.height;
 
-    final yPlane = image.planes[0].bytes;
-    final uPlane = image.planes[1].bytes;
-    final vPlane = image.planes[2].bytes;
+  List<ObjectDetection> _detectColorBlobs(CameraImage img) {
+    final w = img.width;
+    final h = img.height;
+    final yP = img.planes[0].bytes;
+    final uP = img.planes[1].bytes;
+    final vP = img.planes[2].bytes;
+    final yBpr = img.planes[0].bytesPerRow;
+    final uBpr = img.planes[1].bytesPerRow;
+    final uBpp = img.planes[1].bytesPerPixel ?? 1;
+    final vBpr = img.planes[2].bytesPerRow;
+    final vBpp = img.planes[2].bytesPerPixel ?? 1;
 
-    final yBytesPerRow = image.planes[0].bytesPerRow;
-    final uBytesPerRow = image.planes[1].bytesPerRow;
-    final uBytesPerPixel = image.planes[1].bytesPerPixel ?? 1;
-    final vBytesPerRow = image.planes[2].bytesPerRow;
-    final vBytesPerPixel = image.planes[2].bytesPerPixel ?? 1;
+    int minX = width;
+    int maxX = 0;
+    int minY = height;
+    int maxY = 0;
+    int targetPixels = 0;
 
-    const int cellSize = 10;
-    final cols = width ~/ cellSize;
-    final rows = height ~/ cellSize;
-    final active = List<bool>.filled(cols * rows, false);
+    final tR = ((_targetColor.value >> 16) & 0xFF).toDouble();
+    final tG = ((_targetColor.value >> 8) & 0xFF).toDouble();
+    final tB = (_targetColor.value & 0xFF).toDouble();
+    final maxDsq = _colorTolerance * _colorTolerance;
 
-    final targetR = _targetColor.red;
-    final targetG = _targetColor.green;
-    final targetB = _targetColor.blue;
-    final maxDistanceSquared = _colorTolerance * _colorTolerance;
-
-    for (int y = 0; y < height; y += 6) {
-      for (int x = 0; x < width; x += 6) {
+    for (int y = 0; y < height; y += 4) {
+      for (int x = 0; x < width; x += 4) {
         final yIndex = y * yBytesPerRow + x;
         final uvRow = y ~/ 2;
         final uvCol = x ~/ 2;
-
-        final uIndex = uvRow * uBytesPerRow + uvCol * uBytesPerPixel;
-        final vIndex = uvRow * vBytesPerRow + uvCol * vBytesPerPixel;
-
-        if (yIndex >= yPlane.length || uIndex >= uPlane.length || vIndex >= vPlane.length) {
+        final uIdx = uvRow * uBpr + uvCol * uBpp;
+        final vIdx = uvRow * vBpr + uvCol * vBpp;
+        if (yIdx >= yP.length || uIdx >= uP.length || vIdx >= vP.length) {
           continue;
         }
 
@@ -366,221 +403,81 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
         final colorDistanceSquared = (dr * dr) + (dg * dg) + (db * db);
 
         if (colorDistanceSquared <= maxDistanceSquared) {
-          final cx = x ~/ cellSize;
-          final cy = y ~/ cellSize;
-          if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) {
-            active[cy * cols + cx] = true;
-          }
+          targetPixels++;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
         }
       }
     }
 
-    return _clusterObjects(active, cols, rows, minPixels: 3, cellSize: cellSize);
+    if (targetPixels > 15 && maxX > minX && maxY > minY) {
+      return [ObjectDetection(
+        minX: minX.toDouble(),
+        maxX: maxX.toDouble(),
+        minY: minY.toDouble(),
+        maxY: maxY.toDouble(),
+      )];
+    }
+
+    return [];
   }
 
   List<ObjectDetection> _clusterObjects(
     List<bool> pixelMap,
     int width,
-    int height, {
-    required int minPixels,
-    required int cellSize,
-  }) {
-    final visited = List<bool>.filled(pixelMap.length, false);
-    final out = <ObjectDetection>[];
-
-    for (int idx = 0; idx < pixelMap.length; idx++) {
-      if (!pixelMap[idx] || visited[idx]) continue;
-
-      final queue = <int>[idx];
-      visited[idx] = true;
-      int count = 0;
-      int minGX = idx % width;
-      int maxGX = minGX;
-      int minGY = idx ~/ width;
-      int maxGY = minGY;
-
-      while (queue.isNotEmpty && count < 500) {
-        final cur = queue.removeLast();
-        count++;
-        final x = cur % width;
-        final y = cur ~/ width;
-        if (x < minGX) minGX = x;
-        if (x > maxGX) maxGX = x;
-        if (y < minGY) minGY = y;
-        if (y > maxGY) maxGY = y;
-
-        for (int dy = -1; dy <= 1; dy++) {
-          for (int dx = -1; dx <= 1; dx++) {
-            if (dx == 0 && dy == 0) continue;
-            final nx = x + dx;
-            final ny = y + dy;
-            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-            final ni = ny * width + nx;
-            if (pixelMap[ni] && !visited[ni]) {
-              visited[ni] = true;
-              queue.add(ni);
-            }
-          }
-        }
-      }
-
-      if (count < minPixels) continue;
-
-      final minX = (minGX * cellSize).toDouble();
-      final maxX = ((maxGX + 1) * cellSize).toDouble();
-      final minY = (minGY * cellSize).toDouble();
-      final maxY = ((maxGY + 1) * cellSize).toDouble();
-      final frameMaxX = (width * cellSize).toDouble();
-      final frameMaxY = (height * cellSize).toDouble();
-
-      final boxW = maxX - minX;
-      final boxH = maxY - minY;
-      if (boxW < 24 || boxH < 24) continue;
-      if (boxW * boxH < 1000) continue;
-
-      // Expand slightly to capture full object contour instead of fragments.
-      final padX = math.max(8.0, boxW * 0.10);
-      final padY = math.max(8.0, boxH * 0.10);
-      out.add(ObjectDetection(
-        minX: (minX - padX).clamp(0.0, frameMaxX),
-        maxX: (maxX + padX).clamp(0.0, frameMaxX),
-        minY: (minY - padY).clamp(0.0, frameMaxY),
-        maxY: (maxY + padY).clamp(0.0, frameMaxY),
-      ));
-    }
-
-    out.sort((a, b) => b.area.compareTo(a.area));
-    return out;
+    int height,
+    int minPixels,
+  ) {
+    // This function is no longer used but kept for compatibility
+    return [];
   }
 
-  ObjectDetection? _pickLockedDetection(List<ObjectDetection> detections, CameraImage image) {
-    if (detections.isEmpty) return null;
-    if (_lockedDetection == null) {
-      // Nearest proxy without hard calibration: largest width candidate.
-      return detections.reduce((a, b) => a.width >= b.width ? a : b);
-    }
 
-    ObjectDetection? best;
-    double bestScore = -1.0;
-    for (final d in detections) {
-      final iou = _lockedDetection!.iou(d);
-      final dx = (d.center.dx - _lockedDetection!.center.dx) / image.width;
-      final dy = (d.center.dy - _lockedDetection!.center.dy) / image.width;
-      final centerScore = 1.0 - (dx * dx + dy * dy).clamp(0.0, 1.0);
-      final score = (iou * 0.7) + (centerScore * 0.3);
-      if (score > bestScore) {
-        best = d;
-        bestScore = score;
-      }
-    }
-
-    if (best == null) return null;
-    final iouOk = _lockedDetection!.iou(best) >= _lockIouThreshold;
-    final dx = (best.center.dx - _lockedDetection!.center.dx) / image.width;
-    final dy = (best.center.dy - _lockedDetection!.center.dy) / image.width;
-    final centerOk = (dx * dx + dy * dy) <= (_lockCenterThreshold * _lockCenterThreshold);
-
-    if (!iouOk && !centerOk) {
-      return detections.reduce((a, b) => a.width >= b.width ? a : b);
-    }
-    return best;
-  }
-
-  double _estimateDistanceFromLocked(ObjectDetection detection, int imageWidth) {
-    final widthPx = detection.width.clamp(12.0, imageWidth.toDouble());
-    double rawDistance = (_adaptiveProductPxM / widthPx).clamp(0.18, 12.0);
-
-    // CRITICAL: Enforce direction consistency so distance always follows width properly.
-    // If object gets wider (closer), distance MUST decrease. If narrower (farther), distance MUST increase.
-    final prevWidth = _prevDetectionWidth;
-    final prevDist = _hasDistanceEwma ? _distanceEwma : null;
-
-    if (prevWidth != null && prevDist != null && prevWidth > 10.0) {
-      final widthRatio = widthPx / prevWidth;
-      // If width increased (object closer), ensure distance decreased
-      if (widthRatio > 1.02) {
-        if (rawDistance > prevDist) {
-          rawDistance = prevDist * 0.96;
-        }
-      }
-      // If width decreased (object farther), ensure distance increased
-      if (widthRatio < 0.98) {
-        if (rawDistance < prevDist) {
-          rawDistance = prevDist * 1.04;
-        }
-      }
-    }
-
-    // Keep the model adaptive, but much more conservative than the previous
-    // correction-heavy version so the estimate follows the apparent size more
-    // directly when you move closer or farther away.
-    if (_hasDistanceEwma) {
-      final observedProduct = widthPx * rawDistance;
-      final boundedObs = observedProduct
-          .clamp(_adaptiveProductPxM * 0.85, _adaptiveProductPxM * 1.15)
-          .toDouble();
-      _adaptiveProductPxM = _adaptiveProductPxM * 0.97 + boundedObs * 0.03;
-    }
-    _adaptiveSamples = math.min(100000, _adaptiveSamples + 1);
-
-    // Smooth output while preserving responsive behavior.
-    if (!_hasDistanceEwma) {
-      _distanceEwma = rawDistance;
-      _hasDistanceEwma = true;
-    } else {
-      // Shorter distances need faster response, so tighten smoothing for close range.
-      final alpha = rawDistance < 1.2 ? 0.25 : 0.15;
-      _distanceEwma = (_distanceEwma * (1.0 - alpha)) + (rawDistance * alpha);
-    }
-
-    _prevDetectionWidth = widthPx;
-    return _distanceEwma.clamp(0.18, 12.0);
-  }
-
-  void _resetTrackingState() {
-    _distanceM = null;
-    _collisionStatus = 'Scanning';
-    _previousLuma = null;
-    _detections = [];
-    _lockedDetection = null;
-    _missedFrames = 0;
-    _prevDetectionWidth = null;
-    _hasDistanceEwma = false;
-    _distanceEwma = 2.5;
-  }
-
-  void _updateSafetyState(SafetyState nextState) {
-    if (_safetyState == nextState) {
-      return;
-    }
-
-    final previousState = _safetyState;
-    setState(() {
-      _safetyState = nextState;
-    });
-
-    if (nextState == SafetyState.danger) {
-      _dangerPulseController.repeat(reverse: true);
-      _triggerWarningSound(isDanger: true);
-    } else {
-      _dangerPulseController.stop();
-      _dangerPulseController.reset();
-      if (nextState == SafetyState.warning && previousState != nextState) {
-        _triggerWarningSound(isDanger: false);
-      }
-    }
-  }
-
-  void _triggerWarningSound({required bool isDanger}) {
-    // Hook for warning sound integration.
-    SystemSound.play(SystemSoundType.alert);
-    HapticFeedback.mediumImpact();
-    if (isDanger) {
+  void _setSafety(SafetyState next) {
+    if (_safetyState == next) return;
+    final prev = _safetyState;
+    setState(() => _safetyState = next);
+    if (next == SafetyState.danger) {
+      _pulseCtrl.repeat(reverse: true);
+      SystemSound.play(SystemSoundType.alert);
       HapticFeedback.heavyImpact();
+    } else {
+      _pulseCtrl.stop();
+      _pulseCtrl.reset();
+      if (next == SafetyState.warning && prev != SafetyState.warning) {
+        SystemSound.play(SystemSoundType.alert);
+        HapticFeedback.mediumImpact();
+      }
     }
   }
 
-  Color _stateColor() {
+  void _resetTracking() {
+    _lockedDetection = null;
+    _missingFrames = 0;
+    _smoother.clear();
+    _prevLuma = null;
+    _prevBlobWidths.clear();
+    setState(() {
+      _detections = [];
+      _distanceM = null;
+      _collisionStatus = 'Scanning…';
+      _safetyState = SafetyState.unknown;
+      _brakeApplied = false;
+    });
+    _pulseCtrl.stop();
+    _pulseCtrl.reset();
+  }
+
+
+  Color _distColor(double d) {
+    if (d < _dangerM) return const Color(0xFFC23A22);
+    if (d < _warnM) return const Color(0xFFD47D00);
+    return const Color(0xFF1D8A4A);
+  }
+
+  Color get _stateColor {
     switch (_safetyState) {
       case SafetyState.safe:
         return const Color(0xFF1D8A4A);
@@ -593,172 +490,314 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
     }
   }
 
-  String _stateLabel() {
+  String get _stateLabel {
     switch (_safetyState) {
       case SafetyState.safe:
         return 'Safe Distance';
       case SafetyState.warning:
         return 'Warning Zone';
       case SafetyState.danger:
-        return 'Danger Zone';
+        return 'DANGER — Too Close!';
       case SafetyState.unknown:
-        return 'Searching';
+        return 'Searching…';
     }
   }
 
-  String _trackingModeLabel() {
-    return _trackingMode == TrackingMode.anyObject
-        ? 'Any Object'
-        : 'Target Color';
-  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final stateColor = _stateColor();
-    final stateLabel = _stateLabel();
-    final distanceLabel = !_supportsFrameProcessing
+    final distLabel = !_streaming
         ? 'N/A'
-        : _distanceM == null ? '--.- m' : '${_distanceM!.toStringAsFixed(2)} m';
+        : _distanceM == null
+            ? '--.- m'
+            : '${_distanceM!.toStringAsFixed(2)} m';
     final isDanger = _safetyState == SafetyState.danger;
-
-    final badgeColor = switch (_safetyState) {
-      SafetyState.safe => const Color(0xFF1D8A4A),
-      SafetyState.warning => const Color(0xFFD47D00),
-      SafetyState.danger => const Color(0xFFC23A22),
-      SafetyState.unknown => const Color(0xFF607086),
-    };
 
     return Scaffold(
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
           children: [
+            // ── Header ──────────────────────────────────────────────────
+            _buildHeader(theme),
+            const SizedBox(height: 24),
+
+            // ── Camera view ─────────────────────────────────────────────
+            _buildCameraPreview(theme),
+            const SizedBox(height: 20),
+
+            // ── Distance card ───────────────────────────────────────────
+            AnimatedBuilder(
+              animation: _pulseCtrl,
+              builder: (_, __) => _buildDistanceCard(
+                  theme, distLabel, isDanger),
+            ),
+            const SizedBox(height: 16),
+
+            // ── Info row ────────────────────────────────────────────────
             Row(
               children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF0E6BA8),
-                    borderRadius: BorderRadius.circular(14),
-                  ),
-                  child: const Icon(
-                    Icons.directions_car_rounded,
-                    color: Colors.white,
+                Expanded(
+                  child: _InfoCard(
+                    icon: Icons.track_changes_rounded,
+                    title: 'Status',
+                    value: _collisionStatus,
+                    color: _stateColor,
                   ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Rear Distance Monitor',
-                        style: theme.textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      Text(
-                        'Obstacle awareness dashboard',
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: const Color(0xFF607086),
-                        ),
-                      ),
-                    ],
+                  child: _InfoCard(
+                    icon: Icons.memory_rounded,
+                    title: 'Depth Model',
+                    value: _sizeModel._n < 5
+                        ? 'Calibrating…'
+                        : 'Autonomous (${_sizeModel._n} samples)',
+                    color: const Color(0xFF0E6BA8),
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 24),
-            Container(
-              height: 210,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                borderRadius: BorderRadius.circular(20),
-              ),
-              clipBehavior: Clip.antiAlias,
-              child: _isCameraReady && _cameraController != null
-                  ? Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        CameraPreview(_cameraController!),
-                        CustomPaint(
-                          painter: BoundingBoxPainter(
-                            detections: _detections,
-                            imageWidth: _cameraController!.value.previewSize?.width ?? 1,
-                            imageHeight: _cameraController!.value.previewSize?.height ?? 1,
-                          ),
-                        ),
-                        Align(
-                          alignment: Alignment.bottomCenter,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
-                            ),
-                            margin: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withValues(alpha: 0.55),
-                              borderRadius: BorderRadius.circular(999),
-                            ),
-                            child: Text(
-                              _supportsFrameProcessing
-                                  ? 'Mode: ${_trackingMode == TrackingMode.anyObject ? 'Any object' : 'Target color'}'
-                                  : 'Preview only (frame processing unavailable)',
-                              style: TextStyle(color: Colors.white),
-                            ),
-                          ),
-                        ),
-                      ],
-                    )
-                  : Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const Icon(
-                            Icons.camera_alt_rounded,
-                            size: 48,
-                            color: Colors.white38,
-                          ),
-                          const SizedBox(height: 12),
-                          Text(
-                            _sensorStatus,
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 14,
-                            ),
-                            textAlign: TextAlign.center,
-                          ),
-                          const SizedBox(height: 16),
-                          ElevatedButton.icon(
-                            onPressed: _initializeCamera,
-                            icon: const Icon(Icons.refresh_rounded),
-                            label: const Text('Retry Camera'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF0E6BA8),
-                              foregroundColor: Colors.white,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-            ),
+            const SizedBox(height: 16),
+
+            // ── Tracking configuration ──────────────────────────────────
+            _buildTrackingConfig(theme),
+            const SizedBox(height: 16),
+
+            // ── Sensor info ─────────────────────────────────────────────
+            _buildSensorInfo(theme),
             const SizedBox(height: 20),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(18),
+
+            // ── Bottom status bar ───────────────────────────────────────
+            _buildBottomBar(theme, distLabel),
+          ],
+        ),
+      ),
+    );
+  }
+
+
+  Widget _buildHeader(ThemeData theme) => Row(
+        children: [
+          Container(
+            width: 52,
+            height: 52,
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF0E6BA8), Color(0xFF0A4D7A)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Tracking Configuration',
-                    style: theme.textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
+              borderRadius: BorderRadius.circular(16),
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF0E6BA8).withValues(alpha: 0.35),
+                  blurRadius: 10,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: const Icon(Icons.auto_graph_rounded,
+                color: Colors.white, size: 28),
+          ),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Smart Rear Monitor',
+                  style: theme.textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: Colors.white,
+                    letterSpacing: -0.5,
+                  ),
+                ),
+                Text(
+                  'Autonomous Depth • No Calibration Required',
+                  style: theme.textTheme.bodyMedium
+                      ?.copyWith(color: const Color(0xFF94A3B8)),
+                ),
+              ],
+            ),
+          ),
+        ],
+      );
+
+
+  Widget _buildCameraPreview(ThemeData theme) {
+    final previewSize = _camera?.value.previewSize;
+    return Container(
+      height: 240,
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: _stateColor.withValues(alpha: 0.25),
+            blurRadius: 20,
+            spreadRadius: 2,
+          ),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: _cameraReady && _camera != null
+          ? Stack(
+              fit: StackFit.expand,
+              children: [
+                CameraPreview(_camera!),
+
+                // Bounding-box + guide-line overlay
+                CustomPaint(
+                  painter: _AROverlayPainter(
+                    detections: _detections,
+                    imageWidth: previewSize?.width ?? 1,
+                    imageHeight: previewSize?.height ?? 1,
+                    isLocked: _lockedDetection != null,
+                    guideLines: _guideLines,
+                  ),
+                ),
+
+                // Lock badge
+                if (_lockedDetection != null)
+                  Positioned(
+                    top: 10,
+                    right: 10,
+                    child: _badge(
+                      icon: Icons.radar_rounded,
+                      label: _distanceM != null
+                          ? '${_distanceM!.toStringAsFixed(1)} m'
+                          : 'Locked',
+                      color: _stateColor,
                     ),
+                  ),
+
+                // Model warmup badge
+                if (_sizeModel.sampleCount < 5 && _streaming)
+                  Positioned(
+                    top: 10,
+                    left: 10,
+                    child: _badge(
+                      icon: Icons.model_training_rounded,
+                      label: 'Model warming up…',
+                      color: const Color(0xFF607086),
+                    ),
+                  ),
+
+                // Tap-to-reset
+                Positioned.fill(
+                  child: GestureDetector(
+                    onTap: _resetTracking,
+                    behavior: HitTestBehavior.translucent,
+                  ),
+                ),
+
+                // Bottom hint
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Container(
+                    margin: const EdgeInsets.all(12),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 7),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.55),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      _streaming
+                          ? (_lockedDetection != null
+                              ? 'Tap to reset tracking'
+                              : 'Searching for nearest obstacle…')
+                          : 'Preview only — frame streaming unavailable',
+                      style: const TextStyle(
+                          color: Colors.white, fontSize: 12),
+                    ),
+                  ),
+                ),
+              ],
+            )
+          : Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.camera_alt_rounded,
+                      size: 48, color: Colors.white38),
+                  const SizedBox(height: 12),
+                  Text(_sensorStatus,
+                      style: const TextStyle(
+                          color: Colors.white70, fontSize: 14),
+                      textAlign: TextAlign.center),
+                  const SizedBox(height: 14),
+                  ElevatedButton.icon(
+                    onPressed: _initCamera,
+                    icon: const Icon(Icons.refresh_rounded),
+                    label: const Text('Retry'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF0E6BA8),
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _badge(
+      {required IconData icon, required String label, required Color color}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.88),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white, size: 13),
+          const SizedBox(width: 4),
+          Text(label,
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700)),
+        ],
+      ),
+    );
+  }
+
+  // ── Distance card ─────────────────────────────────────────────────────────
+
+  Widget _buildDistanceCard(
+      ThemeData theme, String distLabel, bool isDanger) {
+    final alpha = isDanger
+        ? 0.08 + _pulseCtrl.value * 0.12
+        : 0.06;
+    return Container(
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: _stateColor.withValues(alpha: alpha),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+            color: _stateColor.withValues(alpha: 0.35), width: 1.5),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Nearest Object Distance',
+                    style: theme.textTheme.bodyMedium
+                        ?.copyWith(color: const Color(0xFF94A3B8))),
+                const SizedBox(height: 6),
+                Text(
+                  distLabel,
+                  style: theme.textTheme.displaySmall?.copyWith(
+                    fontWeight: FontWeight.w900,
+                    color: _stateColor,
+                    letterSpacing: -1,
                   ),
                   const SizedBox(height: 10),
                   if (!_supportsFrameProcessing)
@@ -806,8 +845,10 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
                         final selectedMode = selection.first;
                         setState(() {
                           _trackingMode = selectedMode;
-                          _resetTrackingState();
+                          _distanceM = null;
                           _collisionStatus = 'Mode switched';
+                          _previousLuma = null;
+                          _detections = [];
                         });
                       },
                     ),
@@ -1101,74 +1142,124 @@ class _RearDistanceDashboardState extends State<RearDistanceDashboard>
             ),
           ],
         ),
-      ),
-    );
-  }
+      );
 }
 
-class BoundingBoxPainter extends CustomPainter {
-  final List<ObjectDetection> detections;
-  final double imageWidth;
-  final double imageHeight;
 
-  BoundingBoxPainter({
+class _AROverlayPainter extends CustomPainter {
+  final List<ObjectDetection> detections;
+  final double imageWidth, imageHeight;
+  final bool isLocked;
+  final List<Map<String, dynamic>> guideLines;
+
+  _AROverlayPainter({
     required this.detections,
     required this.imageWidth,
     required this.imageHeight,
+    required this.isLocked,
+    required this.guideLines,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final scaleX = size.width / imageWidth;
-    final scaleY = size.height / imageHeight;
+    if (imageWidth == 0 || imageHeight == 0) return;
+    final sx = size.width / imageWidth;
+    final sy = size.height / imageHeight;
 
-    for (int i = 0; i < detections.length; i++) {
-      final detection = detections[i];
-      
+    _drawGuideLines(canvas, size);
+
+    for (final d in detections) {
       final rect = Rect.fromLTRB(
-        detection.minX * scaleX,
-        detection.minY * scaleY,
-        detection.maxX * scaleX,
-        detection.maxY * scaleY,
-      );
+          d.minX * sx, d.minY * sy, d.maxX * sx, d.maxY * sy);
+      final paint = Paint()
+        ..color = d.color
+        ..strokeWidth = isLocked ? 4.0 : 2.5
+        ..style = PaintingStyle.stroke;
 
-      // Draw border
-      canvas.drawRect(
-        rect,
-        Paint()
-          ..color = const Color(0xFF00FF00)
-          ..strokeWidth = 3
-          ..style = PaintingStyle.stroke,
-      );
+      _drawCorners(canvas, rect, paint);
 
-      // Draw label with object index
-      final textPainter = TextPainter(
+      if (isLocked) {
+        final cx = rect.center.dx, cy = rect.center.dy;
+        final cp = Paint()
+          ..color = d.color.withValues(alpha: 0.85)
+          ..strokeWidth = 1.5
+          ..style = PaintingStyle.stroke;
+        canvas.drawLine(
+            Offset(cx - 10, cy), Offset(cx + 10, cy), cp);
+        canvas.drawLine(
+            Offset(cx, cy - 10), Offset(cx, cy + 10), cp);
+        canvas.drawCircle(Offset(cx, cy), 18, cp);
+      }
+
+      final tp = TextPainter(
         text: TextSpan(
-          text: 'Object ${i + 1}',
-          style: const TextStyle(
-            color: Color(0xFF00FF00),
-            fontSize: 12,
+          text: '${d.distance.toStringAsFixed(1)} m',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 13,
             fontWeight: FontWeight.bold,
-            backgroundColor: Colors.black54,
+            backgroundColor: d.color.withValues(alpha: 0.80),
           ),
         ),
         textDirection: TextDirection.ltr,
       );
-      textPainter.layout();
-      textPainter.paint(
-        canvas,
-        Offset(rect.left, rect.top - 20),
-      );
+      tp.layout();
+      tp.paint(canvas, Offset(rect.left, rect.top - 20));
     }
   }
 
-  @override
-  bool shouldRepaint(BoundingBoxPainter oldDelegate) {
-    return oldDelegate.detections.length != detections.length ||
-        oldDelegate.imageWidth != imageWidth ||
-        oldDelegate.imageHeight != imageHeight;
+  void _drawGuideLines(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..strokeWidth = 1.8
+      ..style = PaintingStyle.stroke;
+
+    for (final gl in guideLines) {
+      paint.color = (gl['color'] as Color).withValues(alpha: 0.40);
+      final y = size.height * (gl['yFrac'] as double);
+      final path = Path()
+        ..moveTo(size.width * 0.08, y)
+        ..quadraticBezierTo(size.width * 0.5, y + 18, size.width * 0.92, y);
+      canvas.drawPath(path, paint);
+
+      final tp = TextPainter(
+        text: TextSpan(
+          text: gl['label'] as String,
+          style: TextStyle(
+              color: paint.color, fontSize: 10, fontWeight: FontWeight.bold),
+        ),
+        textDirection: TextDirection.ltr,
+      );
+      tp.layout();
+      tp.paint(canvas, Offset(size.width * 0.02, y - 13));
+    }
   }
+
+  void _drawCorners(Canvas canvas, Rect r, Paint p) {
+    const d = 14.0;
+    // Top-left
+    canvas.drawLine(r.topLeft, r.topLeft + const Offset(d, 0), p);
+    canvas.drawLine(r.topLeft, r.topLeft + const Offset(0, d), p);
+    // Top-right
+    canvas.drawLine(r.topRight, r.topRight + const Offset(-d, 0), p);
+    canvas.drawLine(r.topRight, r.topRight + const Offset(0, d), p);
+    // Bottom-left
+    canvas.drawLine(r.bottomLeft, r.bottomLeft + const Offset(d, 0), p);
+    canvas.drawLine(r.bottomLeft, r.bottomLeft + const Offset(0, -d), p);
+    // Bottom-right
+    canvas.drawLine(r.bottomRight, r.bottomRight + const Offset(-d, 0), p);
+    canvas.drawLine(r.bottomRight, r.bottomRight + const Offset(0, -d), p);
+    // Semi-transparent fill
+    canvas.drawRect(
+        r,
+        Paint()
+          ..color = p.color.withValues(alpha: 0.08)
+          ..style = PaintingStyle.fill);
+  }
+
+  @override
+  bool shouldRepaint(_AROverlayPainter old) => true;
 }
+
 
 class _InfoCard extends StatelessWidget {
   const _InfoCard({
@@ -1177,7 +1268,6 @@ class _InfoCard extends StatelessWidget {
     required this.value,
     required this.color,
   });
-
   final IconData icon;
   final String title;
   final String value;
@@ -1186,31 +1276,34 @@ class _InfoCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
+        color: const Color(0xFF1E293B),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, color: color),
-          const SizedBox(height: 8),
-          Text(
-            title,
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: const Color(0xFF607086),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(10),
             ),
+            child: Icon(icon, color: color, size: 20),
           ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            style: theme.textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w700,
-            ),
-          ),
+          const SizedBox(height: 10),
+          Text(title,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: const Color(0xFF94A3B8))),
+          const SizedBox(height: 3),
+          Text(value,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w700, color: Colors.white),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis),
         ],
       ),
     );
@@ -1218,12 +1311,8 @@ class _InfoCard extends StatelessWidget {
 }
 
 class _StatusRow extends StatelessWidget {
-  const _StatusRow({
-    required this.label,
-    required this.status,
-    required this.color,
-  });
-
+  const _StatusRow(
+      {required this.label, required this.status, required this.color});
   final String label;
   final String status;
   final Color color;
@@ -1231,31 +1320,20 @@ class _StatusRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-
     return Row(
       children: [
         Expanded(
-          child: Text(
-            label,
-            style: theme.textTheme.bodyMedium,
-          ),
-        ),
+            child: Text(label,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: const Color(0xFF94A3B8)))),
         Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(
-            color: color,
-            shape: BoxShape.circle,
-          ),
-        ),
-        const SizedBox(width: 8),
-        Text(
-          status,
-          style: theme.textTheme.bodyMedium?.copyWith(
-            color: const Color(0xFF3D4A59),
-            fontWeight: FontWeight.w600,
-          ),
-        ),
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+        const SizedBox(width: 6),
+        Text(status,
+            style: theme.textTheme.bodySmall?.copyWith(
+                color: Colors.white70, fontWeight: FontWeight.w600)),
       ],
     );
   }
@@ -1268,7 +1346,6 @@ class _ColorChannelSlider extends StatelessWidget {
     required this.activeColor,
     required this.onChanged,
   });
-
   final String label;
   final double value;
   final Color activeColor;
@@ -1279,9 +1356,9 @@ class _ColorChannelSlider extends StatelessWidget {
     return Row(
       children: [
         SizedBox(
-          width: 48,
-          child: Text(label),
-        ),
+            width: 44,
+            child: Text(label,
+                style: const TextStyle(color: Colors.white70, fontSize: 12))),
         Expanded(
           child: SliderTheme(
             data: SliderTheme.of(context).copyWith(
@@ -1289,17 +1366,16 @@ class _ColorChannelSlider extends StatelessWidget {
               thumbColor: activeColor,
             ),
             child: Slider(
-              value: value,
-              min: 0,
-              max: 255,
-              onChanged: onChanged,
-            ),
+                value: value,
+                min: 0,
+                max: 255,
+                onChanged: onChanged),
           ),
         ),
         SizedBox(
-          width: 36,
-          child: Text(value.toInt().toString()),
-        ),
+            width: 32,
+            child: Text(value.toInt().toString(),
+                style: const TextStyle(color: Colors.white70, fontSize: 12))),
       ],
     );
   }
